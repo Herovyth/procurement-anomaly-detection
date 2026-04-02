@@ -1,5 +1,5 @@
-.venv
-dump
-data
-lib
-sct/lib
+.venv/
+dump/
+data/
+lib/
+sct/lib/
