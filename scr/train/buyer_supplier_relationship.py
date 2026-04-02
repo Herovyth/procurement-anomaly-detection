@@ -33,9 +33,11 @@ rel_df["high_single_bid_share"] = (rel_df["single_bid_share"] > 0.5).astype(int)
 loc_b = rel_df["buyer_locality"].astype(str).str.strip().str.lower()
 loc_s = rel_df["supplier_locality"].astype(str).str.strip().str.lower()
 unknown = {"", "nan", "невідомо", "none"}
-rel_df["same_locality"] = (
-    (loc_b == loc_s) & ~loc_b.isin(unknown)
-).astype(int)
+
+# Project requirement: use avg_price signal instead of same_locality.
+# Mark relationship as high-price if avg_price is in top quartile.
+avg_price_thr = rel_df["avg_price"].quantile(0.75)
+rel_df["high_avg_price"] = (rel_df["avg_price"] >= avg_price_thr).astype(int)
 
 rel_df["risk_score"] = (
     2 * rel_df["high_win_share"] +
@@ -45,15 +47,15 @@ rel_df["risk_score"] = (
     # 1 * rel_df["long_streak"] +
     2 * rel_df["high_single_bid_share"] +
     # 1 * rel_df["tight_win_spacing"] +
-    1 * rel_df["same_locality"]
+    1 * rel_df["high_avg_price"]
 )
 
 
 def classify_risk(score):
-    # Max raw score = 11; thresholds scaled from the old 7-point cap (high≥5, medium≥3)
-    if score >= 8:
+    # Max raw score = 9 in current active rules.
+    if score >= 6:
         return "high"
-    elif score >= 5:
+    elif score >= 4:
         return "medium"
     else:
         return "low"

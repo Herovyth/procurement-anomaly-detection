@@ -17,7 +17,7 @@ from sentence_transformers import SentenceTransformer
 import joblib
 import os
 
-CACHE_DIR = "data/cache"
+CACHE_DIR = "../../data/cache"
 os.makedirs(CACHE_DIR, exist_ok=True)
 
 HIGH_SIGNAL_MISSING = [
@@ -34,11 +34,6 @@ LOW_SIGNAL_MISSING = [
     "tender_duration_days_missing",
     "completion_days_missing",
     "cpv_deviation_missing",
-    "doc_nlp_pca_1_missing",
-    "doc_nlp_pca_2_missing",
-    "doc_nlp_pca_3_missing",
-    "doc_nlp_pca_4_missing",
-    "doc_nlp_pca_5_missing",
 ]
 
 SMALL_CPV_GROUP_FALLBACK_K = 100  # fallback to pooled (global) normalization for small CPV groups
@@ -80,16 +75,11 @@ NUMERIC_FEATURES = [
     "winner_price_missing",
     "total_missing_count",
 
-    # Document features
-    "doc_nlp_pca_1",
-    "doc_nlp_pca_2",
-    "doc_nlp_pca_3",
-    "doc_nlp_pca_4",
-    "doc_nlp_pca_5",
 ]
 
 
-TEXT_MODEL = "paraphrase-multilingual-MiniLM-L12-v2"
+TEXT_MODEL = "paraphrase-multilingual-mpnet-base-v2"
+MODEL_CACHE_TAG = TEXT_MODEL.replace("/", "_").replace("-", "_")
 
 # Інтерпретований глобальний blend: semantic_outlier [0,1], semantic_pct [0,1], numeric_pct [0,1]
 # Ваги узгоджені з відносним співвідношенням у risk_score (2 : 1.5 : 1), нормовані на суму 4.5.
@@ -104,7 +94,7 @@ MODEL = None
 
 def compute_embeddings_real(texts_real, suffix="real"):
     """Вираховує або завантажує embeddings лише для реальних тендерів."""
-    cache_path = f"{CACHE_DIR}/embeddings_{suffix}.npy"
+    cache_path = f"{CACHE_DIR}/embeddings_{MODEL_CACHE_TAG}_{suffix}.npy"
 
     if os.path.exists(cache_path):
         emb = np.load(cache_path)
@@ -126,7 +116,7 @@ def compute_embeddings_real(texts_real, suffix="real"):
 
 
 def compute_embeddings_synthetic(texts_synth, suffix="synth"):
-    cache_path = f"{CACHE_DIR}/embeddings_{suffix}.npy"
+    cache_path = f"{CACHE_DIR}/embeddings_{MODEL_CACHE_TAG}_{suffix}.npy"
 
     global MODEL
     if MODEL is None:
@@ -144,9 +134,9 @@ def reduce_embeddings_with_real_and_synth(emb_real, emb_synth=None):
     """
     UMAP: тренуємо на real, потім трансформуємо synthetic.
     """
-    model_path = f"{CACHE_DIR}/umap_model.joblib"
-    reduced_real_path = f"{CACHE_DIR}/umap_reduced_real.npy"
-    reduced_synth_path = f"{CACHE_DIR}/umap_reduced_synth.npy"
+    model_path = f"{CACHE_DIR}/umap_model_{MODEL_CACHE_TAG}.joblib"
+    reduced_real_path = f"{CACHE_DIR}/umap_reduced_real_{MODEL_CACHE_TAG}.npy"
+    reduced_synth_path = f"{CACHE_DIR}/umap_reduced_synth_{MODEL_CACHE_TAG}.npy"
 
     # 1) UMAP для реальних
     if os.path.exists(reduced_real_path) and os.path.exists(model_path):
@@ -185,7 +175,7 @@ def reduce_embeddings_with_real_and_synth(emb_real, emb_synth=None):
     return reduced_real
 
 
-def load_tender_data(path="data/tender_level_features.csv"):
+def load_tender_data(path="../../data/raw/tender_level_features.csv"):
     return pd.read_csv(path)
 
 
@@ -208,6 +198,12 @@ def _ensure_missing_columns(df: pd.DataFrame, cols: list[str]) -> None:
     for c in cols:
         if c not in df.columns:
             df[c] = False
+
+
+def _require_columns(df: pd.DataFrame, cols: list[str], context: str) -> None:
+    missing = [c for c in cols if c not in df.columns]
+    if missing:
+        raise ValueError(f"[{context}] Missing required columns: {missing}")
 
 
 def _cpv_capped_iqr_zscore(
@@ -281,35 +277,64 @@ def semantic_outliers_by_group(
     df: pd.DataFrame,
     embeddings: np.ndarray,
     group_col: str,
-    percentile: float = 5,
-    min_group_size: int = SEMANTIC_GROUP_MIN_TENDERS,
-) -> np.ndarray:
+    k: int = 5,
+) -> tuple[np.ndarray, np.ndarray]:
     """
-    Semantic outlier score per group via low mean cosine similarity.
-    For small groups, falls back to a global score computed over the full dataset.
-    Returns a z-scored vector aligned with df.index.
+    rule:
+    for each tender i in a CPV2 group:
+      - compute mean cosine similarity to k nearest (highest cosine similarities)
+      - mark outlier if mean_similarity < (median(mean_similarity) - 1*std(mean_similarity)) in the group
+    Returns (semantic_zscore, semantic_outlier_label) aligned with df.index.
     """
     n = len(df)
-    outlier_score = np.zeros(n, dtype=float)
+    semantic_strength = np.zeros(n, dtype=float)  # positive => more anomalous
+    semantic_outlier = np.zeros(n, dtype=int)
 
-    # Global baseline (fallback)
-    mean_sim_global = mean_cosine_similarity_sampled(embeddings)
-    thr_global = np.percentile(mean_sim_global, percentile)
-    global_raw = thr_global - mean_sim_global
+    # Exact cosine-nearest requires O(m^2) similarity in each group (m = group size).
+    # We keep a pragmatic cap to avoid memory blow-ups.
+    max_exact_group = 2000
 
-    # Group-specific where possible
-    for g, group in df.groupby(group_col):
+    for _, group in df.groupby(group_col):
         idx = group.index.to_numpy()
-        if len(idx) < min_group_size:
-            outlier_score[idx] = global_raw[idx]
+        m = len(idx)
+        if m < 2:
             continue
 
-        emb = embeddings[idx]
-        mean_sim = mean_cosine_similarity_sampled(emb)
-        threshold = np.percentile(mean_sim, percentile)
-        outlier_score[idx] = threshold - mean_sim
+        emb = embeddings[idx].astype(np.float32, copy=False)
+        kk = min(k, m - 1)
+        if kk <= 0:
+            continue
 
-    return zscore(outlier_score)
+        if m <= max_exact_group:
+            # sim matrix: (m, m), cosine similarity because embeddings are normalized
+            sim = emb @ emb.T
+            np.fill_diagonal(sim, -np.inf)
+            topk = np.partition(sim, -kk, axis=1)[:, -kk:]
+        else:
+            # Approximation for large groups: compute similarities against a random subset.
+            subset_size = max_exact_group
+            subset_idx = np.random.choice(m, size=subset_size, replace=False)
+            emb_sub = emb[subset_idx]
+            sim = emb @ emb_sub.T  # (m, subset_size)
+            kk2 = min(kk, emb_sub.shape[0])
+            topk = np.partition(sim, -kk2, axis=1)[:, -kk2:]
+
+        mean_sim = topk.mean(axis=1)
+        median = float(np.median(mean_sim))
+        std = float(np.std(mean_sim))
+        threshold = median - std
+
+        mask = mean_sim < threshold
+        semantic_outlier[idx] = mask.astype(int)
+        semantic_strength[idx] = np.where(mask, threshold - mean_sim, 0.0)
+
+    strength_std = float(np.std(semantic_strength))
+    if strength_std < 1e-12:
+        semantic_z = np.zeros_like(semantic_strength)
+    else:
+        semantic_z = (semantic_strength - float(np.mean(semantic_strength))) / (strength_std + 1e-9)
+
+    return semantic_z, semantic_outlier
 
 
 def numeric_anomaly_score_by_group(
@@ -388,8 +413,9 @@ def numeric_anomaly_score(X):
 
 
 def detect_tender_anomalies(
-    path: Optional[str] = "data/tender_level_features.csv",
+    path: Optional[str] = "../../data/raw/tender_level_features.csv",
     df: Optional[pd.DataFrame] = None,
+    smoke_sample_size: Optional[int] = None,
 ) -> pd.DataFrame:
     """
     Якщо передано df — використовується він (наприклад, real + synthetic для оцінки).
@@ -400,6 +426,40 @@ def detect_tender_anomalies(
         df = load_tender_data(path)
     else:
         df = df.copy()
+
+    # Keep integer index aligned with numpy arrays (embeddings, scores, etc.).
+    df = df.reset_index(drop=True)
+
+    # Smoke-run: keep it small to validate pipeline quickly.
+    if smoke_sample_size is not None:
+        df = df.head(smoke_sample_size)
+
+    # Required raw columns for the numeric+semantic pipeline.
+    _require_columns(
+        df,
+        cols=[
+            "tender_id",
+            "title",
+            "description",
+            "cpv",
+            "winner_price",
+            "median_cpv",
+            "numberOfBids",
+            "numberOfAdmitted",
+            "log_value_amount",
+            "log_winner_price",
+            "log_price_per_unit",
+            "log_value_per_day",
+            "log_min_bid",
+            "tender_duration_days",
+            "completion_days",
+            "winner_minus_min",
+            "complaints",
+            "tender_changes",
+            "contract_changes",
+        ],
+        context="detect_tender_anomalies",
+    )
 
     is_synth = df["tender_id"].astype(str).str.startswith("SYNTH_")
 
@@ -442,6 +502,19 @@ def detect_tender_anomalies(
     df.loc[winner_price_missing_mask, "price_drop_ratio"] = 0.0
     df.loc[winner_price_missing_mask, "log_winner_price"] = 0.0
 
+    # ------------------------------
+    # numeric anomaly:
+    #   z_j = (p_j - mu_CPV) / sigma_CPV, where p_j = winner_price
+    # Candidates are those with |z_j| > 2.
+    # ------------------------------
+    winner_price_num = pd.to_numeric(df["winner_price"], errors="coerce")
+    cpv_means = winner_price_num.groupby(df["cpv"]).transform("mean")
+    cpv_stds = winner_price_num.groupby(df["cpv"]).transform("std")
+    denom = cpv_stds.replace(0, np.nan) + 1e-9
+    df["cpv_deviation"] = (winner_price_num - cpv_means) / denom
+    df["cpv_deviation"] = df["cpv_deviation"].replace([np.inf, -np.inf], 0.0).fillna(0.0)
+    df.loc[winner_price_missing_mask, "cpv_deviation"] = 0.0
+
     # CPV2 (top-level section) for hierarchical modeling
     df["cpv2"] = df["cpv"].apply(_extract_cpv2)
 
@@ -451,12 +524,25 @@ def detect_tender_anomalies(
     emb_real = compute_embeddings_real(df_real["text"].tolist())
     emb_synth = compute_embeddings_synthetic(df_synth["text"].tolist())
 
-    embeddings = np.vstack([emb_real, emb_synth])
-    # Проєкція у спільний простір через UMAP
-    emb_reduced = reduce_embeddings_with_real_and_synth(emb_real, emb_synth)
+    # Align embeddings (real first, then synth) back to the original df row order.
+    real_idx = df_real.index.to_numpy()
+    synth_idx = df_synth.index.to_numpy()
+
+    emb_dim = emb_real.shape[1]
+    embeddings = np.empty((len(df), emb_dim), dtype=np.float32)
+    embeddings[real_idx] = emb_real
+    embeddings[synth_idx] = emb_synth
+
+    # Проєкція у спільний простір через UMAP (aligned back to df row order)
+    emb_reduced_stacked = reduce_embeddings_with_real_and_synth(emb_real, emb_synth)
+    reduced_dim = emb_reduced_stacked.shape[1]
+    emb_reduced = np.empty((len(df), reduced_dim), dtype=np.float32)
+    n_real = len(df_real)
+    emb_reduced[real_idx] = emb_reduced_stacked[:n_real]
+    emb_reduced[synth_idx] = emb_reduced_stacked[n_real:]
 
     # HDBSCAN на спільному UMAP-просторі
-    hdbscan_path = f"{CACHE_DIR}/hdbscan_labels.npy"
+    hdbscan_path = f"{CACHE_DIR}/hdbscan_labels_{MODEL_CACHE_TAG}.npy"
     clusters = None
     if os.path.exists(hdbscan_path):
         clusters = np.load(hdbscan_path)
@@ -474,21 +560,25 @@ def detect_tender_anomalies(
         )
         clusters = clusterer.fit_predict(emb_reduced)
         np.save(hdbscan_path, clusters)
-        joblib.dump(clusterer, f"{CACHE_DIR}/hdbscan_model.joblib")
+        joblib.dump(clusterer, f"{CACHE_DIR}/hdbscan_model_{MODEL_CACHE_TAG}.joblib")
 
     df["semantic_cluster"] = clusters
 
     # ------------------------------
     # Semantic outlier score (за групами CPV2, fallback на глобальний)
     # ------------------------------
-    semantic_group_score = semantic_outliers_by_group(df, embeddings, group_col="cpv2")
-    df["semantic_score"] = semantic_group_score
+    semantic_score, semantic_outlier = semantic_outliers_by_group(
+        df, embeddings, group_col="cpv2", k=5
+    )
+    df["semantic_score"] = semantic_score
+    df["semantic_outlier"] = semantic_outlier
     df["semantic_pct"] = df["semantic_score"].rank(pct=True, method="average")
 
     # ------------------------------
     # Numeric score: IsolationForest на всьому df (реальні + synthetic)
     # ------------------------------
-    if_scores_path = f"{CACHE_DIR}/if_scores.npy"
+    # numeric scoring depends on how cpv_deviation is constructed, so include a version tag
+    if_scores_path = f"{CACHE_DIR}/if_scores_cpv_z_v2_{MODEL_CACHE_TAG}.npy"
     if os.path.exists(if_scores_path):
         print("Завантажуємо IsolationForest scores з кешу...", flush=True)
         scores = np.load(if_scores_path, allow_pickle=True).item()
@@ -509,15 +599,31 @@ def detect_tender_anomalies(
     # Тепер точно match по довжині
     df["numeric_score"] = numeric_z
     df["numeric_pct"] = numeric_pct
-    df["semantic_score"] = semantic_group_score
 
-    # Глобальний percentile семантики [0, 1]: більше = семантично рідкісніший серед усіх тендерів
-    df["semantic_pct"] = df["semantic_score"].rank(pct=True, method="average")
+    # numeric "candidate screen": |z| > 2
+    # We use cpv_deviation (winner_price CPV z-score) to boost numeric anomalies,
+    # then re-normalize inside each CPV2 group for stable blending.
+    df["numeric_screen"] = (df["cpv_deviation"].abs() > 2).astype(int)
+    df["numeric_score_adj_raw"] = (
+        df["numeric_score"] + df["numeric_screen"].astype(float) * df["cpv_deviation"].abs()
+    )
 
-    # Інтерпретований blend у [0, 1]: числова частина як percentile у межах CPV2 (numeric_pct) +
-    # семантика як semantic_pct + штраф за кластерний викид HDBSCAN
-    threshold = 0.99  # верхній 1%
-    df["semantic_outlier"] = (df["semantic_pct"] >= threshold).astype(int)
+    numeric_score_adj = np.zeros(len(df), dtype=float)
+    numeric_pct_adj = np.zeros(len(df), dtype=float)
+    for _, idx in df.groupby("cpv2").groups.items():
+        idx = np.asarray(list(idx), dtype=int)
+        vals = df.loc[idx, "numeric_score_adj_raw"].to_numpy(dtype=float)
+        if len(vals) > 1 and np.nanstd(vals) > 0:
+            z = (vals - np.nanmean(vals)) / (np.nanstd(vals) + 1e-9)
+        else:
+            z = np.zeros_like(vals, dtype=float)
+        numeric_score_adj[idx] = z
+        numeric_pct_adj[idx] = _rank_pct(vals)
+
+    df["numeric_score"] = numeric_score_adj
+    df["numeric_pct"] = numeric_pct_adj
+
+    # df["semantic_score"]/df["semantic_outlier"] вже обчислені за правилом з диплома
     so = df["semantic_outlier"].astype(float)
     df["risk_blend"] = (
         RISK_BLEND_WEIGHTS["semantic_outlier"] * so
@@ -538,5 +644,10 @@ def detect_tender_anomalies(
 
 
 if __name__ == "__main__":
-    result = detect_tender_anomalies()
-    result.to_csv("data/tender_anomaly_results.csv", index=False)
+    smoke_flag = os.environ.get("SMOKE_TENDER_ANOMALIES", "0") == "1"
+    smoke_n = int(os.environ.get("SMOKE_TENDER_ANOMALIES_N", "200"))
+    if smoke_flag:
+        result = detect_tender_anomalies(smoke_sample_size=smoke_n)
+    else:
+        result = detect_tender_anomalies()
+    result.to_csv("../../data/prepared/tender_anomaly_results.csv", index=False)

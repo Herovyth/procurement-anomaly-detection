@@ -3,6 +3,7 @@ import pandas as pd
 from pyvis.network import Network
 import tempfile
 import re
+from pathlib import Path
 
 st.set_page_config(layout="wide", page_title="Prozorro Anomaly Detector")
 
@@ -161,11 +162,15 @@ div[data-testid="stButton"].analyze-btn > button:hover {
 
 
 # ── Data ──────────────────────────────────────────────────────────────────────
+BASE_DIR = Path(__file__).resolve().parent.parent
+DATA_DIR = BASE_DIR / "data"
+
+
 @st.cache_data
 def load_data():
-    tenders   = pd.read_csv("data/tender_anomaly_results.csv")
-    suppliers = pd.read_csv("data/supplier_anomaly_results.csv")
-    relations = pd.read_csv("data/relationship_anomaly_results.csv")
+    tenders = pd.read_csv(DATA_DIR / "prepared/tender_anomaly_results.csv")
+    suppliers = pd.read_csv(DATA_DIR / "prepared/supplier_anomaly_results.csv")
+    relations = pd.read_csv(DATA_DIR / "prepared/relationship_anomaly_results.csv")
     return tenders, suppliers, relations
 
 tenders, suppliers, relations = load_data()
@@ -213,10 +218,60 @@ def col_exists(df, *names):
     return [n for n in names if n in df.columns]
 
 
+def find_tender(tender_id: str) -> pd.DataFrame:
+    found = tenders[tenders["tender_id"].astype(str).str.strip() == tender_id]
+    if len(found) == 0:
+        found = tenders[tenders["tender_id"].astype(str).str.contains(
+            re.escape(tender_id), na=False
+        )]
+    return found
+
+
+def build_relation_risk_score(df: pd.DataFrame) -> pd.Series:
+    score = pd.Series(0.0, index=df.index, dtype=float)
+    for column, weight in (
+        ("single_bid_share", 0.4),
+        ("buyer_win_share", 0.3),
+        ("supplier_income_share", 0.3),
+    ):
+        if column in df.columns:
+            score = score.add(df[column].fillna(0).astype(float) * weight, fill_value=0)
+    return score.round(4)
+
+
 # ── Header ────────────────────────────────────────────────────────────────────
 st.markdown('<div class="main-title">⚡ Prozorro Anomaly Detector</div>', unsafe_allow_html=True)
 st.markdown("<div class='main-sub'>Виявлення аномальних тендерів · підрядників · зв'язків</div>",
             unsafe_allow_html=True)
+
+overview_rel = relations.copy()
+if "risk_score" not in overview_rel.columns:
+    overview_rel["risk_score"] = build_relation_risk_score(overview_rel)
+
+high_tender_risk = int((tenders["risk_score"] >= tenders["risk_score"].quantile(0.80)).sum()) if "risk_score" in tenders.columns and len(tenders) else 0
+high_supplier_risk = int((suppliers["risk_score"] >= suppliers["risk_score"].quantile(0.80)).sum()) if "risk_score" in suppliers.columns and len(suppliers) else 0
+high_relation_risk = int((overview_rel["risk_score"] >= overview_rel["risk_score"].quantile(0.80)).sum()) if "risk_score" in overview_rel.columns and len(overview_rel) else 0
+
+st.markdown(f"""
+<div class="stats" style="margin-top:.2rem;margin-bottom:1.4rem;">
+    <div class="stat">
+        <div class="stat-val">{len(tenders):,}</div>
+        <div class="stat-key">Тендерів у вибірці</div>
+    </div>
+    <div class="stat">
+        <div class="stat-val">{high_tender_risk:,}</div>
+        <div class="stat-key">Тендерів у top 20% ризику</div>
+    </div>
+    <div class="stat">
+        <div class="stat-val">{high_supplier_risk:,}</div>
+        <div class="stat-key">Підрядників у top 20%</div>
+    </div>
+    <div class="stat">
+        <div class="stat-val">{high_relation_risk:,}</div>
+        <div class="stat-key">Ризикових зв'язків у top 20%</div>
+    </div>
+</div>
+""", unsafe_allow_html=True)
 
 tab1, tab2, tab3 = st.tabs(["🔍  Тендер-чекер", "🏢  Підрядники", "🔗  Зв'язки"])
 
@@ -254,6 +309,20 @@ with tab1:
         unsafe_allow_html=True
     )
 
+    if analyze and raw_input.strip():
+        st.session_state["last_tender_query"] = raw_input.strip()
+        st.session_state["last_tender_id"] = extract_tender_id(raw_input)
+    elif not raw_input.strip():
+        st.session_state.pop("last_tender_query", None)
+        st.session_state.pop("last_tender_id", None)
+
+    active_tid = st.session_state.get("last_tender_id")
+    pending_recheck = (
+        raw_input.strip()
+        and st.session_state.get("last_tender_query")
+        and raw_input.strip() != st.session_state.get("last_tender_query")
+    )
+
     # ── Пустий стан ──────────────────────────────────────────────────────
     if not raw_input.strip():
         st.markdown("""
@@ -274,16 +343,16 @@ with tab1:
         """, unsafe_allow_html=True)
 
     # ── Аналіз ───────────────────────────────────────────────────────────
-    elif analyze:
-        tid = extract_tender_id(raw_input)
+    elif active_tid:
+        tid = active_tid
+        found = find_tender(tid)
 
-        # Точний пошук по tender_id
-        found = tenders[tenders["tender_id"].astype(str).str.strip() == tid]
-        # Часткове співпадіння — якщо вставили скорочений ID
-        if len(found) == 0:
-            found = tenders[tenders["tender_id"].astype(str).str.contains(
-                re.escape(tid), na=False
-            )]
+        if pending_recheck:
+            st.markdown("""
+            <div class="card-sm" style="border-style:dashed;">
+                Натисніть <b>Перевірити</b>, щоб оновити результат для нового посилання.
+            </div>
+            """, unsafe_allow_html=True)
 
         # ── Не знайдено ──
         if len(found) == 0:
@@ -716,95 +785,101 @@ with tab3:
     rel = relations.copy()
 
     if "risk_score" not in rel.columns:
-        rel["risk_score"] = (
-            rel["single_bid_share"].fillna(0)     * 0.4 +
-            rel["buyer_win_share"].fillna(0)       * 0.3 +
-            rel["supplier_income_share"].fillna(0) * 0.3
-        ).round(4)
+        rel["risk_score"] = build_relation_risk_score(rel)
 
-    R_MAX = float(rel["risk_score"].max()) or 1.0
-
-    ctrl, graph = st.columns([1, 3], gap="large")
-
-    with ctrl:
-        st.markdown('<div class="sec">Фільтри графа</div>', unsafe_allow_html=True)
-
-        r_min_v = float(rel["risk_score"].min())
-        r_max_v = float(rel["risk_score"].max())
-        step    = round((r_max_v - r_min_v) / 100, 4) or 0.001
-
-        min_risk = st.slider(
-            "Мін. ризик-скор", r_min_v, r_max_v,
-            round(r_min_v + (r_max_v - r_min_v) * 0.25, 4),
-            step=step, key="rel_risk", format="%.3f"
-        )
-
-        t_max_v  = int(rel["num_tenders"].max()) if "num_tenders" in rel.columns else 50
-        min_tend = st.slider("Мін. к-сть тендерів", 1, max(t_max_v, 2),
-                             min(3, t_max_v), key="rel_tend")
-
-        frel = rel.copy()
-        frel = frel[frel["risk_score"] >= min_risk]
-        if "num_tenders" in rel.columns:
-            frel = frel[frel["num_tenders"] >= min_tend]
-
-        n_pairs = len(frel)
-        n_buy   = frel["buyer_id"].nunique()   if "buyer_id"    in frel.columns else 0
-        n_sup   = frel["supplier_id"].nunique() if "supplier_id" in frel.columns else 0
-
-        st.markdown(f"""
-        <div class="card-sm" style="margin-top:.8rem;">
-            <div class="stats" style="gap:.5rem;">
-                <div class="stat"><div class="stat-val">{n_pairs}</div><div class="stat-key">Пар</div></div>
-                <div class="stat"><div class="stat-val">{n_buy}</div><div class="stat-key">Замовн.</div></div>
-                <div class="stat"><div class="stat-val">{n_sup}</div><div class="stat-key">Підряд.</div></div>
+    if rel.empty:
+        st.markdown("""
+        <div class="card" style="text-align:center;padding:4rem;border-style:dashed;">
+            <div style="font-size:2rem;">📭</div>
+            <div style="font-family:'Unbounded',sans-serif;font-size:.85rem;margin-top:.5rem;">
+                У relations немає даних для побудови графа
             </div>
         </div>
         """, unsafe_allow_html=True)
+    else:
+        R_MAX = float(rel["risk_score"].max()) or 1.0
 
-        st.markdown("""
-        <div class="sec">Легенда</div>
-        <div style="font-size:.7rem;line-height:2.2;">
-            🔵 Замовник &nbsp; 🔴 Підрядник<br>
-            <span style="color:#e84545;font-weight:700;">━━</span> Високий ризик<br>
-            <span style="color:#f59e0b;font-weight:700;">━━</span> Середній ризик<br>
-            <span style="color:#3b82f6;font-weight:700;">━━</span> Низький ризик
-        </div>
-        <div style="font-size:.62rem;color:var(--muted);margin-top:.7rem;line-height:1.7;">
-            Товщина ребра = к-сть тендерів<br>
-            Ризик = sbs×0.4 + bws×0.3 + sis×0.3<br>
-            Наведіть курсор для деталей
-        </div>
-        """, unsafe_allow_html=True)
+        ctrl, graph = st.columns([1, 3], gap="large")
 
-    with graph:
-        st.markdown("""
-        <div style="font-family:'Unbounded',sans-serif;font-size:.9rem;
-                    font-weight:700;margin-bottom:.3rem;">
-            Граф ризикових зв'язків
-        </div>
-        """, unsafe_allow_html=True)
+        with ctrl:
+            st.markdown('<div class="sec">Фільтри графа</div>', unsafe_allow_html=True)
 
-        if len(frel) == 0:
-            st.markdown("""
-            <div class="card" style="text-align:center;padding:4rem;border-style:dashed;">
-                <div style="font-size:2rem;">📭</div>
-                <div style="font-family:'Unbounded',sans-serif;font-size:.85rem;margin-top:.5rem;">
-                    Немає зв'язків за фільтрами
-                </div>
-                <div style="font-size:.7rem;color:var(--muted);margin-top:.3rem;">
-                    Спробуйте знизити порогові значення
+            r_min_v = float(rel["risk_score"].min())
+            r_max_v = float(rel["risk_score"].max())
+            step = round((r_max_v - r_min_v) / 100, 4) or 0.001
+
+            min_risk = st.slider(
+                "Мін. ризик-скор", r_min_v, r_max_v,
+                round(r_min_v + (r_max_v - r_min_v) * 0.25, 4),
+                step=step, key="rel_risk", format="%.3f"
+            )
+
+            t_max_v = int(rel["num_tenders"].max()) if "num_tenders" in rel.columns else 50
+            min_tend = st.slider("Мін. к-сть тендерів", 1, max(t_max_v, 2),
+                                 min(3, t_max_v), key="rel_tend")
+
+            frel = rel.copy()
+            frel = frel[frel["risk_score"] >= min_risk]
+            if "num_tenders" in rel.columns:
+                frel = frel[frel["num_tenders"] >= min_tend]
+
+            n_pairs = len(frel)
+            n_buy = frel["buyer_id"].nunique() if "buyer_id" in frel.columns else 0
+            n_sup = frel["supplier_id"].nunique() if "supplier_id" in frel.columns else 0
+
+            st.markdown(f"""
+            <div class="card-sm" style="margin-top:.8rem;">
+                <div class="stats" style="gap:.5rem;">
+                    <div class="stat"><div class="stat-val">{n_pairs}</div><div class="stat-key">Пар</div></div>
+                    <div class="stat"><div class="stat-val">{n_buy}</div><div class="stat-key">Замовн.</div></div>
+                    <div class="stat"><div class="stat-val">{n_sup}</div><div class="stat-key">Підряд.</div></div>
                 </div>
             </div>
             """, unsafe_allow_html=True)
-        else:
-            CAP  = 200
-            draw = frel.sort_values("risk_score", ascending=False).head(CAP)
-            if len(frel) > CAP:
-                st.markdown(
-                    f'<span class="flag f-yellow">Показано топ-{CAP} з {len(frel)} зв\'язків</span>',
-                    unsafe_allow_html=True
-                )
+
+            st.markdown("""
+            <div class="sec">Легенда</div>
+            <div style="font-size:.7rem;line-height:2.2;">
+                🔵 Замовник &nbsp; 🔴 Підрядник<br>
+                <span style="color:#e84545;font-weight:700;">━━</span> Високий ризик<br>
+                <span style="color:#f59e0b;font-weight:700;">━━</span> Середній ризик<br>
+                <span style="color:#3b82f6;font-weight:700;">━━</span> Низький ризик
+            </div>
+            <div style="font-size:.62rem;color:var(--muted);margin-top:.7rem;line-height:1.7;">
+                Товщина ребра = к-сть тендерів<br>
+                Ризик = sbs×0.4 + bws×0.3 + sis×0.3<br>
+                Наведіть курсор для деталей
+            </div>
+            """, unsafe_allow_html=True)
+
+        with graph:
+            st.markdown("""
+            <div style="font-family:'Unbounded',sans-serif;font-size:.9rem;
+                        font-weight:700;margin-bottom:.3rem;">
+                Граф ризикових зв'язків
+            </div>
+            """, unsafe_allow_html=True)
+
+            if len(frel) == 0:
+                st.markdown("""
+                <div class="card" style="text-align:center;padding:4rem;border-style:dashed;">
+                    <div style="font-size:2rem;">📭</div>
+                    <div style="font-family:'Unbounded',sans-serif;font-size:.85rem;margin-top:.5rem;">
+                        Немає зв'язків за фільтрами
+                    </div>
+                    <div style="font-size:.7rem;color:var(--muted);margin-top:.3rem;">
+                        Спробуйте знизити порогові значення
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+            else:
+                CAP = 200
+                draw = frel.sort_values("risk_score", ascending=False).head(CAP)
+                if len(frel) > CAP:
+                    st.markdown(
+                        f'<span class="flag f-yellow">Показано топ-{CAP} з {len(frel)} зв\'язків</span>',
+                        unsafe_allow_html=True
+                    )
 
             net = Network(height="640px", width="100%",
                           bgcolor="#111318", font_color="#e2e8f0")
@@ -887,19 +962,19 @@ with tab3:
                     )
                 )
 
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".html",
-                                             mode="w", encoding="utf-8") as tmp:
-                net.save_graph(tmp.name)
-                html_str = open(tmp.name, encoding="utf-8").read()
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".html",
+                                                 mode="w", encoding="utf-8") as tmp:
+                    net.save_graph(tmp.name)
+                    html_str = Path(tmp.name).read_text(encoding="utf-8")
 
-            st.components.v1.html(html_str, height=650, scrolling=False)
+                st.components.v1.html(html_str, height=650, scrolling=False)
 
-        if len(frel) > 0:
-            st.markdown('<div class="sec" style="margin-top:1rem;">Таблиця зв\'язків</div>',
-                        unsafe_allow_html=True)
-            show = col_exists(frel, "buyer_id", "supplier_id", "num_tenders", "risk_score",
-                              "single_bid_share", "buyer_win_share", "supplier_income_share")
-            st.dataframe(
-                frel[show].sort_values("risk_score", ascending=False).reset_index(drop=True),
-                use_container_width=True, hide_index=True, height=250
-            )
+            if len(frel) > 0:
+                st.markdown('<div class="sec" style="margin-top:1rem;">Таблиця зв\'язків</div>',
+                            unsafe_allow_html=True)
+                show = col_exists(frel, "buyer_id", "supplier_id", "num_tenders", "risk_score",
+                                  "single_bid_share", "buyer_win_share", "supplier_income_share")
+                st.dataframe(
+                    frel[show].sort_values("risk_score", ascending=False).reset_index(drop=True),
+                    use_container_width=True, hide_index=True, height=250
+                )

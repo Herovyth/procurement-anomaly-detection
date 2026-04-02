@@ -16,7 +16,6 @@ from extraction import (
     extract_tender_features,
     extract_supplier_rows,
     extract_relationship_rows,
-    add_document_nlp_pca_columns,
     FIXED_NOW,
 )
 
@@ -217,7 +216,7 @@ def run():
             "value_amount", "winner_price", "price_per_unit",
             "value_per_day", "min_bid", "winner_minus_min",
             "tender_duration_days", "completion_days", "cpv_deviation",
-        ] + [f"doc_nlp_pca_{i}" for i in range(1, DOC_NLP_PCA_COMPONENTS + 1)]
+        ]
 
         tender_df["description_missing"] = (
             tender_df["description"].isna()
@@ -242,9 +241,21 @@ def run():
             if col in tender_df.columns:
                 tender_df[f"log_{col}"] = np.log1p(tender_df[col])
 
-        tender_df["doc_text_features_missing"] = (
-            tender_df.get("doc_text_features_missing", pd.Series(1.0)).fillna(1.0)
+        # Project requirement: exclude document-meta and doc_nlp_pca_* from prepared tender CSV.
+        drop_cols = (
+            [f"doc_nlp_pca_{i}" for i in range(1, DOC_NLP_PCA_COMPONENTS + 1)]
+            + [f"doc_nlp_pca_{i}_missing" for i in range(1, DOC_NLP_PCA_COMPONENTS + 1)]
+            + [
+                "documents_count",
+                "documents_distinct_types",
+                "documents_with_url",
+                "documents_format_pdf",
+                "documents_downloaded_count",
+                "documents_download_bytes",
+                "doc_text_features_missing",
+            ]
         )
+        tender_df = tender_df.drop(columns=[c for c in drop_cols if c in tender_df.columns], errors="ignore")
 
         append_to_csv(tender_df, OUTPUT_TENDER)
 
@@ -274,6 +285,8 @@ def run():
         agg["win_rate"] = agg["num_wins"] / agg["num_bids"]
         for col in ["avg_contract", "max_contract", "min_contract", "avg_price_per_unit"]:
             agg[f"log_{col}"] = np.log1p(agg[col].fillna(0))
+        # Project requirement: keep log_min/max, remove raw min/max from prepared supplier CSV.
+        agg = agg.drop(columns=[c for c in ["min_contract", "max_contract"] if c in agg.columns], errors="ignore")
         append_to_csv(agg.reset_index(), OUTPUT_SUPPLIER)
         all_supplier_rows = []
 
