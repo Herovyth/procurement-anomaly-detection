@@ -42,7 +42,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-OUT_DIR = "evaluation_results"
+OUT_DIR = "../../results/evaluation_results"
 
 # Percentile threshold for anomaly cut-off (percentile-based in unsupervised setting)
 ANOMALY_PCTL = 0.99

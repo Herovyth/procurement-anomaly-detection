@@ -558,7 +558,7 @@ def run_experiment(df_full: pd.DataFrame, X_full: np.ndarray, out_dir: Path) -> 
 
 def main() -> None:
     csv_path = "../../data/prepared/tender_anomaly_results.csv"
-    out_dir = Path("supplier_results")
+    out_dir = Path("../../results/tender_results")
     out_dir.mkdir(parents=True, exist_ok=True)
 
     df, X = load_data(csv_path)
