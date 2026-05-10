@@ -1,3 +1,19 @@
+"""
+ui.py
+
+Що робить:
+- Дає інтерактивний Streamlit-інтерфейс для трьох сценаріїв:
+  1) перевірка ризику окремого тендера,
+  2) аналіз профілю підрядника,
+  3) перегляд ризикових зв'язків buyer-supplier у вигляді графа.
+
+Коли використовується:
+- Після побудови prepared-датасетів з аномальними оцінками.
+
+Навіщо:
+- Перетворює модельні скори на практичний інструмент для первинного аудиту
+  закупівель (прозорий та інтерпретований результат для користувача).
+"""
 import streamlit as st
 import pandas as pd
 from pyvis.network import Network
@@ -168,6 +184,7 @@ DATA_DIR = BASE_DIR / "data"
 
 @st.cache_data
 def load_data():
+    """Ледачо завантажує підготовлені результати трьох підсистем."""
     tenders = pd.read_csv(DATA_DIR / "prepared/tender_anomaly_results.csv")
     suppliers = pd.read_csv(DATA_DIR / "prepared/supplier_anomaly_results.csv")
     relations = pd.read_csv(DATA_DIR / "prepared/relationship_anomaly_results.csv")
@@ -180,26 +197,32 @@ T_MAX = float(tenders["risk_score"].max())   if "risk_score" in tenders.columns 
 S_MAX = float(suppliers["risk_score"].max()) if "risk_score" in suppliers.columns else 1.0
 
 def score_css(s, mx):
+    """Повертає CSS-клас кольору risk score."""
     r = s / mx if mx else 0
     return "score-high" if r >= .65 else ("score-med" if r >= .35 else "score-low")
 
 def flag_css(s, mx):
+    """Повертає CSS-клас для бейджа рівня ризику."""
     r = s / mx if mx else 0
     return "f-red" if r >= .65 else ("f-yellow" if r >= .35 else "f-ok")
 
 def risk_text(s, mx):
+    """Текстовий вердикт за нормованим risk score."""
     r = s / mx if mx else 0
     return "АНОМАЛЬНИЙ" if r >= .65 else ("ПІДОЗРІЛИЙ" if r >= .35 else "НОРМАЛЬНИЙ")
 
 def gauge_color(s, mx):
+    """Колір прогрес-індикатора ризику."""
     r = s / mx if mx else 0
     return "#e84545" if r >= .65 else ("#f59e0b" if r >= .35 else "#22c55e")
 
 def fmt_pct(v):
+    """Безпечне форматування часток/ймовірностей у відсотки."""
     try:    return f"{float(v):.1%}"
     except: return "n/a"
 
 def fmt_money(v):
+    """Безпечне форматування сум для компактного відображення в UI."""
     try:
         f = float(v)
         if f >= 1_000_000: return f"{f/1_000_000:.2f} млн"
@@ -215,10 +238,12 @@ def extract_tender_id(raw: str) -> str:
     return m.group(1) if m else raw
 
 def col_exists(df, *names):
+    """Повертає тільки ті колонки, які реально існують у DataFrame."""
     return [n for n in names if n in df.columns]
 
 
 def find_tender(tender_id: str) -> pd.DataFrame:
+    """Пошук тендера спочатку exact-match, потім partial-match."""
     found = tenders[tenders["tender_id"].astype(str).str.strip() == tender_id]
     if len(found) == 0:
         found = tenders[tenders["tender_id"].astype(str).str.contains(
@@ -228,6 +253,7 @@ def find_tender(tender_id: str) -> pd.DataFrame:
 
 
 def build_relation_risk_score(df: pd.DataFrame) -> pd.Series:
+    """Fallback rule-based risk score для зв'язків, якщо колонки risk_score немає."""
     score = pd.Series(0.0, index=df.index, dtype=float)
     for column, weight in (
         ("single_bid_share", 0.4),

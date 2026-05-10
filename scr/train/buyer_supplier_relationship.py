@@ -1,23 +1,42 @@
+"""
+buyer_supplier_relationship.py
+
+Що робить:
+- Обчислює rule-based risk score для пари "замовник–постачальник".
+
+Коли використовується:
+- Після формування `relationship_level_features.csv`, як швидкий інтерпретований
+  етап оцінки ризику зв'язків у стилі дипломної записки.
+
+Навіщо:
+- Виявити повторювані/малоконкурентні взаємодії (ознаки можливих узгоджених
+  дій), навіть без складної ML-моделі.
+"""
 import pandas as pd
 
 
 try:
-    rel_df = pd.read_csv("data/relationship_level_features.csv")
+    rel_df = pd.read_csv("../../data/raw/relationship_level_features.csv")
 except FileNotFoundError:
     print("relationship_level_features.csv не знайдено")
     exit()
 
 
+# Висока концентрація перемог одного постачальника у конкретного замовника.
 rel_df["high_win_share"] = (rel_df["buyer_win_share"] > 0.7).astype(int)
 
+# Низька конкуренція в межах взаємодії пари.
 rel_df["low_competition"] = (rel_df["avg_competitors"] <= 2).astype(int)
 
+# Стійка повторюваність взаємодії buyer-supplier.
 rel_df["repeated_pair"] = (rel_df["num_tenders"] >= 5).astype(int)
 
+# Залежність доходу постачальника від одного замовника.
 rel_df["high_supplier_income"] = (rel_df["supplier_income_share"] > 0.5).astype(int)
 
 # rel_df["long_streak"] = (rel_df["win_streak"] >= 3).astype(int)
 
+# Часті процедури з 1 учасником — прямий сигнал низької конкуренції.
 rel_df["high_single_bid_share"] = (rel_df["single_bid_share"] > 0.5).astype(int)
 
 # missing_wr = rel_df["win_regular_months"].isna()
@@ -52,6 +71,7 @@ rel_df["risk_score"] = (
 
 
 def classify_risk(score):
+    """Перетворює сумарний бал правил у категорію ризику для інтерфейсу."""
     # Max raw score = 9 in current active rules.
     if score >= 6:
         return "high"
@@ -63,7 +83,7 @@ def classify_risk(score):
 
 rel_df["risk_level"] = rel_df["risk_score"].apply(classify_risk)
 
-rel_df.to_csv("data/relationship_anomaly_results.csv", index=False, encoding="utf-8")
+rel_df.to_csv("../../data/prepared/relationship_anomaly_results.csv", index=False, encoding="utf-8")
 
 print("Готово! Top-10 підозрілих зв'язків:")
 print(rel_df.sort_values("risk_score", ascending=False).head(10))

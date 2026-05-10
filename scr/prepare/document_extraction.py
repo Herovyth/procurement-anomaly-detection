@@ -1,6 +1,16 @@
 """
-selective HTTP fetch + raw text extraction (PDF/DOCX/HTML/plain).
-Semantic features (SentenceTransformer + PCA) are computed in extraction.py on the full corpus.
+document_extraction.py
+
+Що робить:
+- Вибірково завантажує тендерні документи (Tier 1) і дістає з них сирий текст
+  для подальшої семантичної обробки.
+
+Коли використовується:
+- На етапі підготовки ознак тендера (`extract_tender_features`).
+
+Навіщо:
+- Дати моделі текстовий сигнал про "нетипові формулювання" в документах
+  (відповідно до дипломної частини про semantic anomalies).
 """
 from __future__ import annotations
 

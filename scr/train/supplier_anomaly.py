@@ -1,3 +1,19 @@
+"""
+supplier_anomaly.py
+
+Що робить:
+- Виявляє аномальних підрядників ансамблем з 3 підходів:
+  1) K-Means + silhouette (колективні відхилення),
+  2) Isolation Forest (точкові відхилення),
+  3) LOF (локальні відхилення).
+
+Коли використовується:
+- Після підготовки `supplier_level_features.csv`.
+
+Навіщо:
+- Реалізує підхід із дипломної записки для unsupervised-аналізу профілю
+  постачальників без еталонних міток.
+"""
 import pandas as pd
 import numpy as np
 import warnings
@@ -18,16 +34,14 @@ SUPPLIER_FEATURES = [
     "rejected_bids",
     "complaints",
 
-    "avg_price_per_unit",
-    "avg_contract",
+    "log_avg_contract",
+    "log_avg_price_per_unit",
 
     "contract_changes_share",
     "win_rate",
 
-    "log_avg_contract",
     "log_max_contract",
     "log_min_contract",
-    "log_avg_price_per_unit",
 
     # "avg_contract_missing",
     # "max_contract_missing",
@@ -38,12 +52,14 @@ SUPPLIER_FEATURES = [
 
 
 def load_supplier_data(path="../../data/raw/supplier_level_features.csv"):
+    """Завантажує ознаки підрядників і ставить `supplier_id` як індекс."""
     df = pd.read_csv(path)
     df.set_index("supplier_id", inplace=True)
     return df
 
 
 def prepare_features(df):
+    """Медіанна імпутація + RobustScaler для стійкості до викидів."""
     X = df[SUPPLIER_FEATURES]
 
     imputer = SimpleImputer(strategy="median")
@@ -53,7 +69,23 @@ def prepare_features(df):
     return scaler.fit_transform(X_imp)
 
 
+def _norm(series: pd.Series) -> pd.Series:
+    """Min-max нормалізація в [0, 1]"""
+    mn, mx = series.min(), series.max()
+    if mx - mn < 1e-9:
+        return pd.Series(0.0, index=series.index)
+    return (series - mn) / (mx - mn)
+
+
 def detect_supplier_anomalies(path="../../data/raw/supplier_level_features.csv"):
+    """
+    Рахує ризиковість підрядників і повертає ранжований DataFrame.
+
+    Логіка ансамблю:
+    - `ensemble_outlier=1`, якщо принаймні 2 з 3 методів позначили аномалію.
+    - `risk_score` — середнє z-нормованих сил аномальності + невеликий бонус
+      за консенсус ансамблю.
+    """
     df = load_supplier_data(path)
     X = prepare_features(df)
 
@@ -131,10 +163,12 @@ def detect_supplier_anomalies(path="../../data/raw/supplier_level_features.csv")
     df["ensemble_outlier"] = ((kmeans_out + iforest_out + lof_out) >= 2).astype(int)
 
     # Final ranking score: average z-scored strengths, with a small bonus for ensemble outliers.
-    df["risk_score"] = (
-        (df["kmeans_score"] + df["iforest_score"] + df["lof_score"]) / 3.0
-        + 0.25 * df["ensemble_outlier"].astype(float)
-    )
+    df["risk_score"] = (_norm(df["kmeans_score"])
+                        + _norm(df["iforest_score"])
+                        + _norm(df["lof_score"])
+                        ) / 3.0 + 0.25 * df["ensemble_outlier"].astype(float)
+
+    df["risk_score"] = _norm(df["risk_score"])
 
     df["risk_rank"] = df["risk_score"].rank(ascending=False, method="min")
     return df.reset_index().sort_values("risk_score", ascending=False)

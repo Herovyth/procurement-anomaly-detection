@@ -1,4 +1,19 @@
 from __future__ import annotations
+"""
+tender_anomaly.py
+
+Що робить:
+- Обчислює аномальність тендерів, комбінуючи:
+  - numeric ризик (Isolation Forest + статистичні сигнали в межах CPV),
+  - semantic ризик (SBERT-ембеддинги + подібність у групах).
+
+Коли використовується:
+- Після підготовки `tender_level_features.csv`.
+
+Навіщо:
+- Відповідає дипломній ідеї: ловити як фінансово-структурні, так і
+  текстово-семантичні відхилення в умовах закупівель.
+"""
 
 import pandas as pd
 import numpy as np
@@ -42,47 +57,33 @@ SEMANTIC_GROUP_MIN_TENDERS = 100  # min tenders in group to compute semantic-out
 
 
 NUMERIC_FEATURES = [
-    # Competition / counts
-    "numberOfBids",
-    "numberOfAdmitted",
-    "bids_cpv_zscore",
-    "admitted_cpv_zscore",
-    "admitted_ratio",
-
-    # CPV-normalized and price-related
-    "cpv_deviation",
-
-    # Log-valued signals (stable across CPV scale differences)
     "log_value_amount",
     "log_winner_price",
     "log_price_per_unit",
     "log_value_per_day",
+    "numberOfBids",
+    "numberOfAdmitted",
     "log_min_bid",
-    "price_drop_ratio",
-
-    # Tender timing & differences
+    "winner_minus_min",
     "tender_duration_days",
     "completion_days",
-    "winner_minus_min",
-
-    # Behavioral / process
     "complaints",
     "tender_changes",
     "contract_changes",
-
-    # Missingness: only high-signal flags + one aggregated counter
+    "cpv_deviation",
     "description_missing",
     "winner_price_missing",
     "total_missing_count",
-
+    "bids_cpv_zscore",
+    "admitted_cpv_zscore",
+    "admitted_ratio",
+    "price_drop_ratio",
 ]
 
 
 TEXT_MODEL = "paraphrase-multilingual-mpnet-base-v2"
 MODEL_CACHE_TAG = TEXT_MODEL.replace("/", "_").replace("-", "_")
 
-# Інтерпретований глобальний blend: semantic_outlier [0,1], semantic_pct [0,1], numeric_pct [0,1]
-# Ваги узгоджені з відносним співвідношенням у risk_score (2 : 1.5 : 1), нормовані на суму 4.5.
 RISK_BLEND_WEIGHTS = {
     "semantic_outlier": 2.0 / 4.5,
     "semantic_pct": 1.5 / 4.5,
@@ -93,7 +94,7 @@ MODEL = None
 
 
 def compute_embeddings_real(texts_real, suffix="real"):
-    """Вираховує або завантажує embeddings лише для реальних тендерів."""
+    """Кодує тексти реальних тендерів у SBERT-вектори з кешуванням."""
     cache_path = f"{CACHE_DIR}/embeddings_{MODEL_CACHE_TAG}_{suffix}.npy"
 
     if os.path.exists(cache_path):
@@ -116,6 +117,10 @@ def compute_embeddings_real(texts_real, suffix="real"):
 
 
 def compute_embeddings_synthetic(texts_synth, suffix="synth"):
+    """Кодує synthetic-тексти в той самий семантичний простір."""
+    if not texts_synth:
+        return None
+
     cache_path = f"{CACHE_DIR}/embeddings_{MODEL_CACHE_TAG}_{suffix}.npy"
 
     global MODEL
@@ -131,14 +136,11 @@ def compute_embeddings_synthetic(texts_synth, suffix="synth"):
 
 
 def reduce_embeddings_with_real_and_synth(emb_real, emb_synth=None):
-    """
-    UMAP: тренуємо на real, потім трансформуємо synthetic.
-    """
+    """Зменшує розмірність ембеддингів через UMAP і повторно використовує кеш."""
     model_path = f"{CACHE_DIR}/umap_model_{MODEL_CACHE_TAG}.joblib"
     reduced_real_path = f"{CACHE_DIR}/umap_reduced_real_{MODEL_CACHE_TAG}.npy"
     reduced_synth_path = f"{CACHE_DIR}/umap_reduced_synth_{MODEL_CACHE_TAG}.npy"
 
-    # 1) UMAP для реальних
     if os.path.exists(reduced_real_path) and os.path.exists(model_path):
         reducer = joblib.load(model_path)
         reduced_real = np.load(reduced_real_path)
@@ -163,7 +165,6 @@ def reduce_embeddings_with_real_and_synth(emb_real, emb_synth=None):
         np.save(reduced_real_path, reduced_real)
         joblib.dump(reducer, model_path)
 
-    # 2) UMAP для synthetic
     reduced_synth = None
     if emb_synth is not None:
         print("Проєктуємо synthetic в той же простір UMAP...", flush=True)
@@ -179,15 +180,9 @@ def load_tender_data(path="../../data/raw/tender_level_features.csv"):
     return pd.read_csv(path)
 
 
-def mean_cosine_similarity_sampled(embeddings, sample_size=500):
-    idx = np.random.choice(len(embeddings), size=min(sample_size, len(embeddings)), replace=False)
-    sample = embeddings[idx]
-    sim = cosine_similarity(sample, embeddings)
-    return sim.mean(axis=0)
 
 
 def _to_bool_series(s: pd.Series) -> pd.Series:
-    # CSV typically stores bools as "True"/"False" strings; normalize robustly.
     if s.dtype == bool:
         return s
     ss = s.astype(str).str.strip().str.lower()
@@ -214,8 +209,8 @@ def _cpv_capped_iqr_zscore(
     k: int = SMALL_CPV_GROUP_FALLBACK_K,
 ) -> None:
     """
-    Z-score within CPV using (median, IQR) with fallback to pooled (global) stats
-    when a CPV group is too small.
+    Нормалізує ознаку в межах CPV через robust z-score (median/IQR).
+    Для малих CPV-груп використовує глобальний fallback, щоб уникнути шуму.
     """
     if cpv_col not in df.columns:
         df[cpv_col] = None
@@ -224,13 +219,11 @@ def _cpv_capped_iqr_zscore(
     sizes_map = df[cpv_col].map(sizes).fillna(0)
     mask_small = sizes_map.lt(k)
 
-    # Pooled stats
     global_median = df[value_col].median()
     global_q25 = df[value_col].quantile(0.25)
     global_q75 = df[value_col].quantile(0.75)
     global_iqr = (global_q75 - global_q25) + 1e-9
 
-    # CPV stats
     cpv_median = df.groupby(cpv_col)[value_col].median()
     cpv_q25 = df.groupby(cpv_col)[value_col].quantile(0.25)
     cpv_q75 = df.groupby(cpv_col)[value_col].quantile(0.75)
@@ -241,7 +234,6 @@ def _cpv_capped_iqr_zscore(
 
     z = (df[value_col] - median_per_row) / iqr_per_row
 
-    # Fallback for small groups
     if mask_small.any():
         z.loc[mask_small] = (df.loc[mask_small, value_col] - global_median) / global_iqr
 
@@ -249,13 +241,9 @@ def _cpv_capped_iqr_zscore(
 
 
 def _extract_cpv2(cpv: object) -> str:
-    """
-    CPV is expected in format '########-#'. We use the first two digits as the top-level section (CPV2).
-    """
     if cpv is None or (isinstance(cpv, float) and np.isnan(cpv)):
         return "NA"
     s = str(cpv).strip()
-    # Keep only digits for safety; CPV2 is first 2 digits of the 8-digit code.
     digits = "".join(ch for ch in s if ch.isdigit())
     if len(digits) < 2:
         return "NA"
@@ -263,10 +251,6 @@ def _extract_cpv2(cpv: object) -> str:
 
 
 def _rank_pct(values: np.ndarray) -> np.ndarray:
-    """
-    Percentile rank in [0, 1], higher = more anomalous.
-    Handles ties via average ranks.
-    """
     if len(values) == 0:
         return values
     s = pd.Series(values)
@@ -280,18 +264,13 @@ def semantic_outliers_by_group(
     k: int = 5,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
-    rule:
-    for each tender i in a CPV2 group:
-      - compute mean cosine similarity to k nearest (highest cosine similarities)
-      - mark outlier if mean_similarity < (median(mean_similarity) - 1*std(mean_similarity)) in the group
-    Returns (semantic_zscore, semantic_outlier_label) aligned with df.index.
+    Виявляє семантичні аномалії всередині групи:
+    низька середня cosine-подібність до k найближчих сусідів => підозра.
     """
     n = len(df)
-    semantic_strength = np.zeros(n, dtype=float)  # positive => more anomalous
+    semantic_strength = np.zeros(n, dtype=float)
     semantic_outlier = np.zeros(n, dtype=int)
 
-    # Exact cosine-nearest requires O(m^2) similarity in each group (m = group size).
-    # We keep a pragmatic cap to avoid memory blow-ups.
     max_exact_group = 2000
 
     for _, group in df.groupby(group_col):
@@ -306,16 +285,14 @@ def semantic_outliers_by_group(
             continue
 
         if m <= max_exact_group:
-            # sim matrix: (m, m), cosine similarity because embeddings are normalized
             sim = emb @ emb.T
             np.fill_diagonal(sim, -np.inf)
             topk = np.partition(sim, -kk, axis=1)[:, -kk:]
         else:
-            # Approximation for large groups: compute similarities against a random subset.
             subset_size = max_exact_group
             subset_idx = np.random.choice(m, size=subset_size, replace=False)
             emb_sub = emb[subset_idx]
-            sim = emb @ emb_sub.T  # (m, subset_size)
+            sim = emb @ emb_sub.T
             kk2 = min(kk, emb_sub.shape[0])
             topk = np.partition(sim, -kk2, axis=1)[:, -kk2:]
 
@@ -343,13 +320,12 @@ def numeric_anomaly_score_by_group(
     min_group_size: int = CPV2_MIN_TENDERS_FOR_MODEL,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
-    Train IsolationForest per group; for small groups use a pooled fallback model.
-    Returns (numeric_zscore, numeric_percentile) aligned with the original row order.
+    Рахує numeric аномальність Isolation Forest-ом по групах CPV2.
+    Для замалих груп використовує загальну fallback-модель.
     """
     n = X_scaled.shape[0]
     raw = np.zeros(n, dtype=float)
 
-    # Fallback model trained on all data
     fallback_if = IsolationForest(
         n_estimators=300,
         contamination="auto",
@@ -358,10 +334,8 @@ def numeric_anomaly_score_by_group(
     fallback_if.fit(X_scaled)
     fallback_raw = -fallback_if.score_samples(X_scaled)
 
-    # Group sizes
     sizes = groups.value_counts(dropna=False)
 
-    # Fill per group
     for g, idx in groups.groupby(groups).groups.items():
         idx = np.asarray(list(idx), dtype=int)
         if sizes.get(g, 0) < min_group_size:
@@ -376,7 +350,6 @@ def numeric_anomaly_score_by_group(
         iso.fit(X_scaled[idx])
         raw[idx] = -iso.score_samples(X_scaled[idx])
 
-    # Normalize within group for global comparability
     z = np.zeros(n, dtype=float)
     pct = np.zeros(n, dtype=float)
     for g, idx in groups.groupby(groups).groups.items():
@@ -388,28 +361,12 @@ def numeric_anomaly_score_by_group(
 
 
 def prepare_numeric_features(df):
+    """Імпутація + robust масштабування для числового блоку тендерних ознак."""
     X = df[NUMERIC_FEATURES]
-
     imputer = SimpleImputer(strategy="median")
     scaler = RobustScaler()
-
     X_imp = imputer.fit_transform(X)
     return scaler.fit_transform(X_imp)
-
-
-def numeric_anomaly_score(X):
-    """
-    Backwards-compatible helper: global numeric score (z-scored IF raw scores).
-    Prefer numeric_anomaly_score_by_group for CPV-hierarchical models.
-    """
-    iso = IsolationForest(
-        n_estimators=1000,
-        contamination="auto",
-        random_state=42
-    )
-    iso.fit(X)
-    scores = -iso.score_samples(X)
-    return zscore(scores)
 
 
 def detect_tender_anomalies(
@@ -418,8 +375,13 @@ def detect_tender_anomalies(
     smoke_sample_size: Optional[int] = None,
 ) -> pd.DataFrame:
     """
-    Якщо передано df — використовується він (наприклад, real + synthetic для оцінки).
-    Інакше читається CSV за path.
+    Основний pipeline оцінки ризику тендерів.
+
+    Кроки:
+    1) feature engineering (missing signals, CPV-нормалізації, ratio),
+    2) semantic блок (SBERT + групові outlier-оцінки),
+    3) numeric блок (IF + CPV-aware скоринг),
+    4) blended risk score для підсумкового ранжування.
     """
 
     if df is None:
@@ -427,36 +389,20 @@ def detect_tender_anomalies(
     else:
         df = df.copy()
 
-    # Keep integer index aligned with numpy arrays (embeddings, scores, etc.).
     df = df.reset_index(drop=True)
 
-    # Smoke-run: keep it small to validate pipeline quickly.
     if smoke_sample_size is not None:
         df = df.head(smoke_sample_size)
 
-    # Required raw columns for the numeric+semantic pipeline.
     _require_columns(
         df,
         cols=[
-            "tender_id",
-            "title",
-            "description",
-            "cpv",
-            "winner_price",
-            "median_cpv",
-            "numberOfBids",
-            "numberOfAdmitted",
-            "log_value_amount",
-            "log_winner_price",
-            "log_price_per_unit",
-            "log_value_per_day",
-            "log_min_bid",
-            "tender_duration_days",
-            "completion_days",
-            "winner_minus_min",
-            "complaints",
-            "tender_changes",
-            "contract_changes",
+            "tender_id", "cpv", "status", "title", "description",
+            "log_value_amount", "log_winner_price", "log_price_per_unit",
+            "log_value_per_day", "numberOfBids", "numberOfAdmitted",
+            "log_min_bid", "winner_minus_min", "tender_duration_days",
+            "completion_days", "complaints", "tender_changes",
+            "contract_changes", "median_cpv",
         ],
         context="detect_tender_anomalies",
     )
@@ -471,14 +417,11 @@ def detect_tender_anomalies(
     df_real = df[~is_synth].copy()
     df_synth = df[is_synth].copy()
 
-    # ------------------------------
-    # Feature engineering (CPV-robust + missingness consolidation)
-    # ------------------------------
+    # ── Feature engineering ───────────────────────────────────────────────────
     _ensure_missing_columns(df, HIGH_SIGNAL_MISSING + LOW_SIGNAL_MISSING)
     for c in HIGH_SIGNAL_MISSING + LOW_SIGNAL_MISSING:
         df[c] = _to_bool_series(df[c])
 
-    # 1) aggregated missingness counter (replaces most *_missing flags)
     df["total_missing_count"] = df[LOW_SIGNAL_MISSING].astype(int).sum(axis=1)
 
     # 2) CPV-normalized competition signals with small-CPV fallback
@@ -490,23 +433,19 @@ def detect_tender_anomalies(
     admitted = df["numberOfAdmitted"].fillna(0)
     df["admitted_ratio"] = np.where(bids > 0, admitted / bids, 0.0)
 
-    # 4) price drop ratio vs CPV expected (expected = median_cpv)
+    # Відновлюємо winner_price із log_winner_price (в extraction зберігається лише log версія)
+    df["winner_price"] = np.expm1(df["log_winner_price"])
+
     expected = df["median_cpv"].replace([np.inf, -np.inf], np.nan)
     winner = df["winner_price"].replace([np.inf, -np.inf], np.nan)
     denom = expected.replace(0, np.nan) + 1e-9
     df["price_drop_ratio"] = ((expected - winner) / denom).replace([np.inf, -np.inf], 0).fillna(0.0)
 
-    # 5) gating / neutralization when winner_price is missing:
-    #    suppress derived signals (price_drop_ratio) and the copied log signal (log_winner_price)
     winner_price_missing_mask = df["winner_price_missing"].astype(bool)
     df.loc[winner_price_missing_mask, "price_drop_ratio"] = 0.0
     df.loc[winner_price_missing_mask, "log_winner_price"] = 0.0
 
-    # ------------------------------
-    # numeric anomaly:
-    #   z_j = (p_j - mu_CPV) / sigma_CPV, where p_j = winner_price
-    # Candidates are those with |z_j| > 2.
-    # ------------------------------
+    # Використовуємо winner_price CPV z-score як єдину версію cpv_deviation
     winner_price_num = pd.to_numeric(df["winner_price"], errors="coerce")
     cpv_means = winner_price_num.groupby(df["cpv"]).transform("mean")
     cpv_stds = winner_price_num.groupby(df["cpv"]).transform("std")
@@ -515,12 +454,9 @@ def detect_tender_anomalies(
     df["cpv_deviation"] = df["cpv_deviation"].replace([np.inf, -np.inf], 0.0).fillna(0.0)
     df.loc[winner_price_missing_mask, "cpv_deviation"] = 0.0
 
-    # CPV2 (top-level section) for hierarchical modeling
     df["cpv2"] = df["cpv"].apply(_extract_cpv2)
 
-    # ------------------------------
-    # Обчислення embeddings і зниження розмірності
-    # ------------------------------
+    # ── Embeddings ────────────────────────────────────────────────────────────
     emb_real = compute_embeddings_real(df_real["text"].tolist())
     emb_synth = compute_embeddings_synthetic(df_synth["text"].tolist())
 
@@ -531,17 +467,18 @@ def detect_tender_anomalies(
     emb_dim = emb_real.shape[1]
     embeddings = np.empty((len(df), emb_dim), dtype=np.float32)
     embeddings[real_idx] = emb_real
-    embeddings[synth_idx] = emb_synth
+    if emb_synth is not None:
+        embeddings[synth_idx] = emb_synth
 
-    # Проєкція у спільний простір через UMAP (aligned back to df row order)
+    # ── UMAP + HDBSCAN ────────────────────────────────────────────────────────
     emb_reduced_stacked = reduce_embeddings_with_real_and_synth(emb_real, emb_synth)
     reduced_dim = emb_reduced_stacked.shape[1]
     emb_reduced = np.empty((len(df), reduced_dim), dtype=np.float32)
     n_real = len(df_real)
     emb_reduced[real_idx] = emb_reduced_stacked[:n_real]
-    emb_reduced[synth_idx] = emb_reduced_stacked[n_real:]
+    if emb_synth is not None:
+        emb_reduced[synth_idx] = emb_reduced_stacked[n_real:]
 
-    # HDBSCAN на спільному UMAP-просторі
     hdbscan_path = f"{CACHE_DIR}/hdbscan_labels_{MODEL_CACHE_TAG}.npy"
     clusters = None
     if os.path.exists(hdbscan_path):
@@ -564,9 +501,7 @@ def detect_tender_anomalies(
 
     df["semantic_cluster"] = clusters
 
-    # ------------------------------
-    # Semantic outlier score (за групами CPV2, fallback на глобальний)
-    # ------------------------------
+    # ── Semantic outlier score ────────────────────────────────────────────────
     semantic_score, semantic_outlier = semantic_outliers_by_group(
         df, embeddings, group_col="cpv2", k=5
     )
@@ -574,38 +509,33 @@ def detect_tender_anomalies(
     df["semantic_outlier"] = semantic_outlier
     df["semantic_pct"] = df["semantic_score"].rank(pct=True, method="average")
 
-    # ------------------------------
-    # Numeric score: IsolationForest на всьому df (реальні + synthetic)
-    # ------------------------------
-    # numeric scoring depends on how cpv_deviation is constructed, so include a version tag
+    # ── Numeric score: IsolationForest ────────────────────────────────────────
     if_scores_path = f"{CACHE_DIR}/if_scores_cpv_z_v2_{MODEL_CACHE_TAG}.npy"
     if os.path.exists(if_scores_path):
         print("Завантажуємо IsolationForest scores з кешу...", flush=True)
         scores = np.load(if_scores_path, allow_pickle=True).item()
         numeric_z = scores["z"]
         numeric_pct = scores["pct"]
-        # Перевірка довжини
         if len(numeric_z) != len(df):
             print("[WARN] Cached numeric scores size mismatch! Recomputing...")
             X_num_scaled = prepare_numeric_features(df)
-            numeric_z, numeric_pct = numeric_anomaly_score_by_group(X_num_scaled, groups=df["cpv2"])
+            numeric_z, numeric_pct = numeric_anomaly_score_by_group(
+                X_num_scaled, groups=df["cpv2"]
+            )
             np.save(if_scores_path, {"z": numeric_z, "pct": numeric_pct})
     else:
         print("Тренуємо IsolationForest на всіх тендерах...", flush=True)
         X_num_scaled = prepare_numeric_features(df)
-        numeric_z, numeric_pct = numeric_anomaly_score_by_group(X_num_scaled, groups=df["cpv2"])
+        numeric_z, numeric_pct = numeric_anomaly_score_by_group(
+            X_num_scaled, groups=df["cpv2"]
+        )
         np.save(if_scores_path, {"z": numeric_z, "pct": numeric_pct})
 
-    # Тепер точно match по довжині
-    df["numeric_score"] = numeric_z
-    df["numeric_pct"] = numeric_pct
-
-    # numeric "candidate screen": |z| > 2
-    # We use cpv_deviation (winner_price CPV z-score) to boost numeric anomalies,
-    # then re-normalize inside each CPV2 group for stable blending.
-    df["numeric_screen"] = (df["cpv_deviation"].abs() > 2).astype(int)
+    # ── Numeric score adjustment (cpv_deviation boost) ────────────────────────
+    df["numeric_screen"]        = (df["cpv_deviation"].abs() > 2).astype(int)
     df["numeric_score_adj_raw"] = (
-        df["numeric_score"] + df["numeric_screen"].astype(float) * df["cpv_deviation"].abs()
+        numeric_z
+        + df["numeric_screen"].astype(float) * df["cpv_deviation"].abs()
     )
 
     numeric_score_adj = np.zeros(len(df), dtype=float)
@@ -623,29 +553,20 @@ def detect_tender_anomalies(
     df["numeric_score"] = numeric_score_adj
     df["numeric_pct"] = numeric_pct_adj
 
-    # df["semantic_score"]/df["semantic_outlier"] вже обчислені за правилом з диплома
     so = df["semantic_outlier"].astype(float)
-    df["risk_blend"] = (
+    df["risk_score"] = (
         RISK_BLEND_WEIGHTS["semantic_outlier"] * so
         + RISK_BLEND_WEIGHTS["semantic_pct"] * df["semantic_pct"]
         + RISK_BLEND_WEIGHTS["numeric_pct"] * df["numeric_pct"]
     )
-
-    df["risk_score"] = (
-        2.0 * df["semantic_outlier"].astype(int) +
-        1.5 * df["semantic_score"] +
-        1.0 * df["numeric_score"]
-    )
-
     df["risk_rank"] = df["risk_score"].rank(ascending=False, method="min")
-    df["global_risk_rank"] = df["risk_blend"].rank(ascending=False, method="min")
 
     return df.sort_values("risk_score", ascending=False)
 
 
 if __name__ == "__main__":
     smoke_flag = os.environ.get("SMOKE_TENDER_ANOMALIES", "0") == "1"
-    smoke_n = int(os.environ.get("SMOKE_TENDER_ANOMALIES_N", "200"))
+    smoke_n    = int(os.environ.get("SMOKE_TENDER_ANOMALIES_N", "200"))
     if smoke_flag:
         result = detect_tender_anomalies(smoke_sample_size=smoke_n)
     else:
