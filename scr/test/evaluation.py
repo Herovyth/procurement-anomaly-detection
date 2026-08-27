@@ -58,6 +58,31 @@ def _safe_metric(fn, X: np.ndarray, labels: np.ndarray) -> float | None:
         return None
 
 
+def _safe_semantic_cluster_metrics(
+    X_sem: np.ndarray,
+    tender_labels: np.ndarray,
+) -> tuple[float | None, float | None]:
+    """
+    ВАЖЛИВО: для тендерів метрики кластеризації рахуємо тільки в тому просторі,
+    де побудовано semantic_cluster (тобто UMAP-проєкція SBERT-ембеддингів).
+    """
+    metric_mask = tender_labels != -1
+    if metric_mask.sum() < 2 or len(np.unique(tender_labels[metric_mask])) < 2:
+        return None, None
+
+    sil = _safe_metric(
+        lambda a, b: silhouette_score(a, b, metric="euclidean"),
+        X_sem[metric_mask],
+        tender_labels[metric_mask],
+    )
+    db = _safe_metric(
+        davies_bouldin_score,
+        X_sem[metric_mask],
+        tender_labels[metric_mask],
+    )
+    return sil, db
+
+
 def _percentile_threshold(values: np.ndarray, p: float) -> float:
     v = pd.to_numeric(pd.Series(values), errors="coerce").replace([np.inf, -np.inf], np.nan).dropna().to_numpy()
     if len(v) == 0:
@@ -74,7 +99,16 @@ def _mode_or_first(values: pd.Series) -> int | float | str | None:
     return values.iloc[0]
 
 
-def _plot_hist(values: np.ndarray, title: str, path: str, threshold: float | None = None) -> None:
+def _plot_hist(
+    values: np.ndarray,
+    title: str,
+    path: str,
+    threshold: float | None = None,
+    *,
+    xlabel: str,
+    ylabel: str = "Кількість",
+    log_y: bool = False,
+) -> None:
     v = pd.to_numeric(pd.Series(values), errors="coerce").replace([np.inf, -np.inf], np.nan).dropna().to_numpy()
     if len(v) == 0:
         return
@@ -83,12 +117,27 @@ def _plot_hist(values: np.ndarray, title: str, path: str, threshold: float | Non
     if threshold is not None and np.isfinite(threshold):
         plt.axvline(threshold, linestyle="--", linewidth=2)
     plt.title(title)
+    plt.xlabel(xlabel)
+    if log_y:
+        plt.yscale("log")
+        plt.ylim(bottom=0.8)
+        plt.ylabel(f"{ylabel} (лог. шкала осі Y)")
+    else:
+        plt.ylabel(ylabel)
     plt.tight_layout()
     plt.savefig(path, dpi=150)
     plt.close()
 
 
-def _plot_2d_scatter(points: np.ndarray, is_anom: np.ndarray, title: str, path: str) -> None:
+def _plot_2d_scatter(
+    points: np.ndarray,
+    is_anom: np.ndarray,
+    title: str,
+    path: str,
+    *,
+    xlabel: str,
+    ylabel: str,
+) -> None:
     if len(points) == 0:
         return
     plt.figure(figsize=(7, 6))
@@ -96,6 +145,8 @@ def _plot_2d_scatter(points: np.ndarray, is_anom: np.ndarray, title: str, path: 
     plt.scatter(points[~mask, 0], points[~mask, 1], s=6, alpha=0.35, label="normal")
     plt.scatter(points[mask, 0], points[mask, 1], s=10, alpha=0.85, label="anomaly")
     plt.title(title)
+    plt.xlabel(xlabel)
+    plt.ylabel(ylabel)
     plt.legend()
     plt.tight_layout()
     plt.savefig(path, dpi=150)
@@ -105,7 +156,7 @@ def _plot_2d_scatter(points: np.ndarray, is_anom: np.ndarray, title: str, path: 
 def evaluate_suppliers(path: str = "../../data/raw/supplier_level_features.csv") -> None:
     print("[Supplier] Scoring anomalies (K-Means + IF + LOF ensemble)...", flush=True)
     scored = detect_supplier_anomalies(path=path)
-    scored.to_csv("../../data/raw/supplier_anomaly_results.csv", index=False)
+    scored.to_csv("../../data/prepared/supplier_anomaly_results.csv", index=False)
 
     # rebuild feature matrix for metrics/visualizations
     df = pd.read_csv(path)
@@ -126,6 +177,8 @@ def evaluate_suppliers(path: str = "../../data/raw/supplier_level_features.csv")
         title=f"Supplier risk_score distribution (p={ANOMALY_PCTL:.2f} threshold)",
         path=f"{OUT_DIR}/eval_supplier_risk_score_hist.png",
         threshold=thr,
+        xlabel="risk_score",
+        log_y=True,
     )
 
     # PCA / UMAP for visual validation
@@ -137,6 +190,8 @@ def evaluate_suppliers(path: str = "../../data/raw/supplier_level_features.csv")
         is_anom=is_anom_by_id,
         title="Suppliers PCA(2) — anomalies highlighted",
         path=f"{OUT_DIR}/eval_supplier_pca2.png",
+        xlabel="Перша головна компонента (PC1)",
+        ylabel="Друга головна компонента (PC2)",
     )
     um2 = umap.UMAP(n_neighbors=15, n_components=2, min_dist=0.1, metric="euclidean", random_state=42).fit_transform(X)
     _plot_2d_scatter(
@@ -144,6 +199,8 @@ def evaluate_suppliers(path: str = "../../data/raw/supplier_level_features.csv")
         is_anom=is_anom_by_id,
         title="Suppliers UMAP(2) — anomalies highlighted",
         path=f"{OUT_DIR}/eval_supplier_umap2.png",
+        xlabel="Перша компонента UMAP",
+        ylabel="Друга компонента UMAP",
     )
 
 
@@ -164,18 +221,24 @@ def evaluate_tenders(path: str = "../../data/raw/tender_level_features.csv") -> 
         title=f"Tender {risk_col} distribution (p={ANOMALY_PCTL:.2f} threshold)",
         path=f"{OUT_DIR}/eval_tender_risk_blend_hist.png",
         threshold=thr,
+        xlabel=risk_col,
+        log_y=True,
     )
     _plot_hist(
         scored["numeric_score"].to_numpy(),
         title="Tender numeric_score distribution",
         path=f"{OUT_DIR}/eval_tender_numeric_score_hist.png",
         threshold=None,
+        xlabel="numeric_score",
+        log_y=True,
     )
     _plot_hist(
         scored["semantic_score"].to_numpy(),
         title="Tender semantic_score distribution",
         path=f"{OUT_DIR}/eval_tender_semantic_score_hist.png",
         threshold=None,
+        xlabel="semantic_score",
+        log_y=True,
     )
 
     # clustering quality in semantic space (UMAP-reduced SBERT embeddings)
@@ -206,18 +269,8 @@ def evaluate_tenders(path: str = "../../data/raw/tender_level_features.csv") -> 
         else:
             tender_labels = pd.to_numeric(scored.get("semantic_cluster"), errors="coerce").reindex(range(len(df_sem))).fillna(-1).to_numpy(dtype=int)
 
-        metric_mask = tender_labels != -1
-        if metric_mask.sum() >= 2 and len(np.unique(tender_labels[metric_mask])) >= 2:
-            sil = _safe_metric(
-                lambda a, b: silhouette_score(a, b, metric="euclidean"),
-                X_sem[metric_mask],
-                tender_labels[metric_mask],
-            )
-            db = _safe_metric(
-                davies_bouldin_score,
-                X_sem[metric_mask],
-                tender_labels[metric_mask],
-            )
+        sil, db = _safe_semantic_cluster_metrics(X_sem=X_sem, tender_labels=tender_labels)
+        if sil is not None or db is not None:
             print(f"[Tender] semantic silhouette={sil if sil is not None else 'NA'}  davies_bouldin={db if db is not None else 'NA'}")
         else:
             print("[Tender] semantic silhouette=NA  davies_bouldin=NA (insufficient non-noise clusters)")
@@ -226,6 +279,7 @@ def evaluate_tenders(path: str = "../../data/raw/tender_level_features.csv") -> 
 
     avail = [c for c in NUMERIC_FEATURES if c in scored.columns]
     if len(avail) == len(NUMERIC_FEATURES):
+        print("[Tender] Numeric PCA/UMAP plots are for visual validation only (not for semantic_cluster quality metrics).")
         X_scaled = prepare_numeric_features(scored)
 
         if "tender_id" in scored.columns and "tender_id" in df_raw.columns:
@@ -241,6 +295,8 @@ def evaluate_tenders(path: str = "../../data/raw/tender_level_features.csv") -> 
             is_anom=is_anom,
             title="Tenders PCA(2) over numeric features — anomalies highlighted",
             path=f"{OUT_DIR}/eval_tender_pca2_numeric.png",
+            xlabel="Перша головна компонента (PC1)",
+            ylabel="Друга головна компонента (PC2)",
         )
         um2 = umap.UMAP(
             n_neighbors=15, n_components=2, min_dist=0.1,
@@ -251,6 +307,8 @@ def evaluate_tenders(path: str = "../../data/raw/tender_level_features.csv") -> 
             is_anom=is_anom,
             title="Tenders UMAP(2) over numeric features — anomalies highlighted",
             path=f"{OUT_DIR}/eval_tender_umap2_numeric.png",
+            xlabel="Перша компонента UMAP",
+            ylabel="Друга компонента UMAP",
         )
     else:
         print(f"Skip PCA/UMAP numeric viz: missing {len(NUMERIC_FEATURES) - len(avail)} numeric feature columns.")

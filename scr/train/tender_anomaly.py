@@ -93,9 +93,11 @@ RISK_BLEND_WEIGHTS = {
 MODEL = None
 
 
-def compute_embeddings_real(texts_real, suffix="real"):
+def compute_embeddings_real(texts_real, suffix="real", cache_dir: Optional[str] = None):
     """Кодує тексти реальних тендерів у SBERT-вектори з кешуванням."""
-    cache_path = f"{CACHE_DIR}/embeddings_{MODEL_CACHE_TAG}_{suffix}.npy"
+    cdir = cache_dir if cache_dir is not None else CACHE_DIR
+    os.makedirs(cdir, exist_ok=True)
+    cache_path = f"{cdir}/embeddings_{MODEL_CACHE_TAG}_{suffix}.npy"
 
     if os.path.exists(cache_path):
         emb = np.load(cache_path)
@@ -116,12 +118,14 @@ def compute_embeddings_real(texts_real, suffix="real"):
     return emb
 
 
-def compute_embeddings_synthetic(texts_synth, suffix="synth"):
+def compute_embeddings_synthetic(texts_synth, suffix="synth", cache_dir: Optional[str] = None):
     """Кодує synthetic-тексти в той самий семантичний простір."""
     if not texts_synth:
         return None
 
-    cache_path = f"{CACHE_DIR}/embeddings_{MODEL_CACHE_TAG}_{suffix}.npy"
+    cdir = cache_dir if cache_dir is not None else CACHE_DIR
+    os.makedirs(cdir, exist_ok=True)
+    cache_path = f"{cdir}/embeddings_{MODEL_CACHE_TAG}_{suffix}.npy"
 
     global MODEL
     if MODEL is None:
@@ -135,11 +139,13 @@ def compute_embeddings_synthetic(texts_synth, suffix="synth"):
     return emb
 
 
-def reduce_embeddings_with_real_and_synth(emb_real, emb_synth=None):
+def reduce_embeddings_with_real_and_synth(emb_real, emb_synth=None, cache_dir: Optional[str] = None):
     """Зменшує розмірність ембеддингів через UMAP і повторно використовує кеш."""
-    model_path = f"{CACHE_DIR}/umap_model_{MODEL_CACHE_TAG}.joblib"
-    reduced_real_path = f"{CACHE_DIR}/umap_reduced_real_{MODEL_CACHE_TAG}.npy"
-    reduced_synth_path = f"{CACHE_DIR}/umap_reduced_synth_{MODEL_CACHE_TAG}.npy"
+    cdir = cache_dir if cache_dir is not None else CACHE_DIR
+    os.makedirs(cdir, exist_ok=True)
+    model_path = f"{cdir}/umap_model_{MODEL_CACHE_TAG}.joblib"
+    reduced_real_path = f"{cdir}/umap_reduced_real_{MODEL_CACHE_TAG}.npy"
+    reduced_synth_path = f"{cdir}/umap_reduced_synth_{MODEL_CACHE_TAG}.npy"
 
     if os.path.exists(reduced_real_path) and os.path.exists(model_path):
         reducer = joblib.load(model_path)
@@ -373,6 +379,7 @@ def detect_tender_anomalies(
     path: Optional[str] = "../../data/raw/tender_level_features.csv",
     df: Optional[pd.DataFrame] = None,
     smoke_sample_size: Optional[int] = None,
+    cache_dir: Optional[str] = None,
 ) -> pd.DataFrame:
     """
     Основний pipeline оцінки ризику тендерів.
@@ -383,6 +390,9 @@ def detect_tender_anomalies(
     3) numeric блок (IF + CPV-aware скоринг),
     4) blended risk score для підсумкового ранжування.
     """
+
+    cdir = cache_dir if cache_dir is not None else CACHE_DIR
+    os.makedirs(cdir, exist_ok=True)
 
     if df is None:
         df = load_tender_data(path)
@@ -457,8 +467,8 @@ def detect_tender_anomalies(
     df["cpv2"] = df["cpv"].apply(_extract_cpv2)
 
     # ── Embeddings ────────────────────────────────────────────────────────────
-    emb_real = compute_embeddings_real(df_real["text"].tolist())
-    emb_synth = compute_embeddings_synthetic(df_synth["text"].tolist())
+    emb_real = compute_embeddings_real(df_real["text"].tolist(), cache_dir=cdir)
+    emb_synth = compute_embeddings_synthetic(df_synth["text"].tolist(), cache_dir=cdir)
 
     # Align embeddings (real first, then synth) back to the original df row order.
     real_idx = df_real.index.to_numpy()
@@ -471,7 +481,7 @@ def detect_tender_anomalies(
         embeddings[synth_idx] = emb_synth
 
     # ── UMAP + HDBSCAN ────────────────────────────────────────────────────────
-    emb_reduced_stacked = reduce_embeddings_with_real_and_synth(emb_real, emb_synth)
+    emb_reduced_stacked = reduce_embeddings_with_real_and_synth(emb_real, emb_synth, cache_dir=cdir)
     reduced_dim = emb_reduced_stacked.shape[1]
     emb_reduced = np.empty((len(df), reduced_dim), dtype=np.float32)
     n_real = len(df_real)
@@ -479,7 +489,7 @@ def detect_tender_anomalies(
     if emb_synth is not None:
         emb_reduced[synth_idx] = emb_reduced_stacked[n_real:]
 
-    hdbscan_path = f"{CACHE_DIR}/hdbscan_labels_{MODEL_CACHE_TAG}.npy"
+    hdbscan_path = f"{cdir}/hdbscan_labels_{MODEL_CACHE_TAG}.npy"
     clusters = None
     if os.path.exists(hdbscan_path):
         clusters = np.load(hdbscan_path)
@@ -497,7 +507,7 @@ def detect_tender_anomalies(
         )
         clusters = clusterer.fit_predict(emb_reduced)
         np.save(hdbscan_path, clusters)
-        joblib.dump(clusterer, f"{CACHE_DIR}/hdbscan_model_{MODEL_CACHE_TAG}.joblib")
+        joblib.dump(clusterer, f"{cdir}/hdbscan_model_{MODEL_CACHE_TAG}.joblib")
 
     df["semantic_cluster"] = clusters
 
@@ -510,7 +520,7 @@ def detect_tender_anomalies(
     df["semantic_pct"] = df["semantic_score"].rank(pct=True, method="average")
 
     # ── Numeric score: IsolationForest ────────────────────────────────────────
-    if_scores_path = f"{CACHE_DIR}/if_scores_cpv_z_v2_{MODEL_CACHE_TAG}.npy"
+    if_scores_path = f"{cdir}/if_scores_cpv_z_v2_{MODEL_CACHE_TAG}.npy"
     if os.path.exists(if_scores_path):
         print("Завантажуємо IsolationForest scores з кешу...", flush=True)
         scores = np.load(if_scores_path, allow_pickle=True).item()

@@ -23,11 +23,19 @@ from datetime import datetime
 import numpy as np
 
 import requests
-from document_extraction import (
-    DOCUMENT_FETCH_ENABLED,
-    summarize_tier1_for_documents,
-    tier1_placeholder_meta_and_blob,
-)
+
+try:
+    from .document_extraction import (
+        DOCUMENT_FETCH_ENABLED,
+        summarize_tier1_for_documents,
+        tier1_placeholder_meta_and_blob,
+    )
+except ImportError:
+    from document_extraction import (
+        DOCUMENT_FETCH_ENABLED,
+        summarize_tier1_for_documents,
+        tier1_placeholder_meta_and_blob,
+    )
 
 FIXED_NOW = datetime(2025, 12, 11)
 

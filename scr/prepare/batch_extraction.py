@@ -32,17 +32,32 @@ import requests
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 np.seterr(all="ignore")
 
-from document_extraction import (
-    DOCUMENT_FETCH_ENABLED,
-    DOC_NLP_PCA_COMPONENTS,
-    TEXT_MODEL,
-)
-from extraction import (
-    aggregate_supplier_features,
-    extract_relationship_rows,
-    extract_supplier_rows,
-    extract_tender_features,
-)
+try:
+    from .document_extraction import (
+        DOCUMENT_FETCH_ENABLED,
+        DOC_NLP_PCA_COMPONENTS,
+        TEXT_MODEL,
+    )
+except ImportError:
+    from document_extraction import (
+        DOCUMENT_FETCH_ENABLED,
+        DOC_NLP_PCA_COMPONENTS,
+        TEXT_MODEL,
+    )
+try:
+    from .extraction import (
+        aggregate_supplier_features,
+        extract_relationship_rows,
+        extract_supplier_rows,
+        extract_tender_features,
+    )
+except ImportError:
+    from extraction import (
+        aggregate_supplier_features,
+        extract_relationship_rows,
+        extract_supplier_rows,
+        extract_tender_features,
+    )
 
 # ── Налаштування ──────────────────────────────────────────────────────────────
 BATCH_SIZE            = 1000

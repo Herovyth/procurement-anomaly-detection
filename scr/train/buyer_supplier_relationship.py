@@ -12,78 +12,87 @@ buyer_supplier_relationship.py
 - Виявити повторювані/малоконкурентні взаємодії (ознаки можливих узгоджених
   дій), навіть без складної ML-моделі.
 """
+from __future__ import annotations
+
+from pathlib import Path
+
 import pandas as pd
 
+RULE_COLUMNS = [
+    "high_win_share",
+    "low_competition",
+    "repeated_pair",
+    "high_supplier_income",
+    "high_single_bid_share",
+    "high_avg_price",
+]
 
-try:
-    rel_df = pd.read_csv("../../data/raw/relationship_level_features.csv")
-except FileNotFoundError:
-    print("relationship_level_features.csv не знайдено")
-    exit()
+RULE_WEIGHTS: dict[str, int] = {
+    "high_win_share": 2,
+    "low_competition": 1,
+    "repeated_pair": 2,
+    "high_supplier_income": 1,
+    "high_single_bid_share": 2,
+    "high_avg_price": 1,
+}
 
+RULE_LABELS_UA: dict[str, str] = {
+    "high_win_share": "Висока частка перемог постачальника у замовника",
+    "low_competition": "Низька конкуренція (avg_competitors ≤ 2)",
+    "repeated_pair": "Повторювана пара (num_tenders ≥ 5)",
+    "high_supplier_income": "Висока залежність доходу постачальника від замовника",
+    "high_single_bid_share": "Висока частка процедур з 1 учасником",
+    "high_avg_price": "Висока середня ціна (верхній квартиль)",
+}
 
-# Висока концентрація перемог одного постачальника у конкретного замовника.
-rel_df["high_win_share"] = (rel_df["buyer_win_share"] > 0.7).astype(int)
-
-# Низька конкуренція в межах взаємодії пари.
-rel_df["low_competition"] = (rel_df["avg_competitors"] <= 2).astype(int)
-
-# Стійка повторюваність взаємодії buyer-supplier.
-rel_df["repeated_pair"] = (rel_df["num_tenders"] >= 5).astype(int)
-
-# Залежність доходу постачальника від одного замовника.
-rel_df["high_supplier_income"] = (rel_df["supplier_income_share"] > 0.5).astype(int)
-
-# rel_df["long_streak"] = (rel_df["win_streak"] >= 3).astype(int)
-
-# Часті процедури з 1 учасником — прямий сигнал низької конкуренції.
-rel_df["high_single_bid_share"] = (rel_df["single_bid_share"] > 0.5).astype(int)
-
-# missing_wr = rel_df["win_regular_months"].isna()
-# if "win_regular_months_missing" in rel_df.columns:
-#     missing_wr = missing_wr | (rel_df["win_regular_months_missing"].astype(int) != 0)
-# rel_df["tight_win_spacing"] = (
-#     (~missing_wr)
-#     & (rel_df["num_tenders"] >= 2)
-#     & (rel_df["win_regular_months"] >= 0)
-#     & (rel_df["win_regular_months"] <= 4.0)
-# ).astype(int)
-
-loc_b = rel_df["buyer_locality"].astype(str).str.strip().str.lower()
-loc_s = rel_df["supplier_locality"].astype(str).str.strip().str.lower()
-unknown = {"", "nan", "невідомо", "none"}
-
-# Project requirement: use avg_price signal instead of same_locality.
-# Mark relationship as high-price if avg_price is in top quartile.
-avg_price_thr = rel_df["avg_price"].quantile(0.75)
-rel_df["high_avg_price"] = (rel_df["avg_price"] >= avg_price_thr).astype(int)
-
-rel_df["risk_score"] = (
-    2 * rel_df["high_win_share"] +
-    1 * rel_df["low_competition"] +
-    2 * rel_df["repeated_pair"] +
-    1 * rel_df["high_supplier_income"] +
-    # 1 * rel_df["long_streak"] +
-    2 * rel_df["high_single_bid_share"] +
-    # 1 * rel_df["tight_win_spacing"] +
-    1 * rel_df["high_avg_price"]
-)
+MAX_RISK_SCORE = sum(RULE_WEIGHTS.values())
 
 
-def classify_risk(score):
+def classify_risk(score: int | float) -> str:
     """Перетворює сумарний бал правил у категорію ризику для інтерфейсу."""
-    # Max raw score = 9 in current active rules.
     if score >= 6:
         return "high"
-    elif score >= 4:
+    if score >= 4:
         return "medium"
-    else:
-        return "low"
+    return "low"
 
 
-rel_df["risk_level"] = rel_df["risk_score"].apply(classify_risk)
+def score_relationships(rel_df: pd.DataFrame) -> pd.DataFrame:
+    """Додає бінарні правила, risk_score та risk_level до датафрейму пар."""
+    out = rel_df.copy()
 
-rel_df.to_csv("../../data/prepared/relationship_anomaly_results.csv", index=False, encoding="utf-8")
+    out["high_win_share"] = (out["buyer_win_share"] > 0.7).astype(int)
+    out["low_competition"] = (out["avg_competitors"] <= 2).astype(int)
+    out["repeated_pair"] = (out["num_tenders"] >= 5).astype(int)
+    out["high_supplier_income"] = (out["supplier_income_share"] > 0.5).astype(int)
+    out["high_single_bid_share"] = (out["single_bid_share"] > 0.5).astype(int)
 
-print("Готово! Top-10 підозрілих зв'язків:")
-print(rel_df.sort_values("risk_score", ascending=False).head(10))
+    avg_price_thr = out["avg_price"].quantile(0.75)
+    out["high_avg_price"] = (out["avg_price"] >= avg_price_thr).astype(int)
+
+    out["risk_score"] = sum(out[col] * weight for col, weight in RULE_WEIGHTS.items())
+    out["risk_level"] = out["risk_score"].apply(classify_risk)
+    return out
+
+
+def main() -> None:
+    project_root = Path(__file__).resolve().parents[2]
+    input_path = project_root / "data/raw/relationship_level_features.csv"
+    output_path = project_root / "data/prepared/relationship_anomaly_results.csv"
+
+    try:
+        rel_df = pd.read_csv(input_path)
+    except FileNotFoundError:
+        print("relationship_level_features.csv не знайдено")
+        raise SystemExit(1)
+
+    scored = score_relationships(rel_df)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    scored.to_csv(output_path, index=False, encoding="utf-8")
+
+    print("Готово! Top-10 підозрілих зв'язків:")
+    print(scored.sort_values("risk_score", ascending=False).head(10))
+
+
+if __name__ == "__main__":
+    main()

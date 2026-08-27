@@ -90,7 +90,7 @@ def detect_supplier_anomalies(path="../../data/raw/supplier_level_features.csv")
     X = prepare_features(df)
 
     # --- 1) K-Means for "collective" outliers ---
-    # Thesis: choose K using silhouette, then treat negative silhouette as suspicious.
+    # choose K using silhouette, then treat negative silhouette as suspicious.
     n = X.shape[0]
     if n < 3:
         raise ValueError(f"Not enough supplier samples for anomaly detection: n={n}")
@@ -145,11 +145,7 @@ def detect_supplier_anomalies(path="../../data/raw/supplier_level_features.csv")
 
     # --- 3) LOF for local outliers ---
     n_neighbors = int(min(20, max(2, n - 1)))
-    try:
-        lof = LocalOutlierFactor(n_neighbors=n_neighbors, contamination="auto")
-    except TypeError:
-        # Older sklearn versions may not support contamination="auto"
-        lof = LocalOutlierFactor(n_neighbors=n_neighbors, contamination=0.1)
+    lof = LocalOutlierFactor(n_neighbors=n_neighbors, contamination="auto")
 
     lof_pred = lof.fit_predict(X)  # -1 = outlier
     lof_strength_raw = -lof.negative_outlier_factor_  # higher => more anomalous

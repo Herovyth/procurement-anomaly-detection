@@ -3,7 +3,7 @@ ui.py
 
 Що робить:
 - Дає інтерактивний Streamlit-інтерфейс для трьох сценаріїв:
-  1) перевірка ризику окремого тендера,
+  1) перевірка ризику тендера за внутрішнім id CDB (32 hex) → JSON з public-api.prozorro.gov.ua → ознаки → модель,
   2) аналіз профілю підрядника,
   3) перегляд ризикових зв'язків buyer-supplier у вигляді графа.
 
@@ -16,6 +16,7 @@ ui.py
 """
 import streamlit as st
 import pandas as pd
+import numpy as np
 from pyvis.network import Network
 import tempfile
 import re
@@ -192,6 +193,10 @@ def load_data():
 
 tenders, suppliers, relations = load_data()
 
+# Колонка CPV у prepared CSV може називатися cpv або cpv_code
+TENDER_CPV_COL = "cpv_code" if "cpv_code" in tenders.columns else "cpv"
+BIDS_COL = "num_bids" if "num_bids" in tenders.columns else "numberOfBids"
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 T_MAX = float(tenders["risk_score"].max())   if "risk_score" in tenders.columns   else 1.0
 S_MAX = float(suppliers["risk_score"].max()) if "risk_score" in suppliers.columns else 1.0
@@ -230,26 +235,63 @@ def fmt_money(v):
         return f"{f:.2f}"
     except: return "n/a"
 
-def extract_tender_id(raw: str) -> str:
-    """Extract tenderID from a Prozorro URL or return raw string."""
-    raw = raw.strip()
-    # https://prozorro.gov.ua/tender/UA-2024-01-15-000123-a
-    m = re.search(r'(UA-\d{4}-\d{2}-\d{2}-\d+(?:-\w+)?)', raw)
-    return m.group(1) if m else raw
+def extract_cdb_tender_id(raw: str) -> str:
+    """
+    Витягує або нормалізує внутрішній id закупівлі CDB (32 hex).
+    Дозволено вставити UUID з дефісами або довільний текст, де всередині є 32 hex підряд.
+    """
+    s = raw.strip()
+    if not s:
+        return ""
+    m = re.search(
+        r"\b([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})\b", s, re.I
+    )
+    if m:
+        return m.group(1).lower().replace("-", "")
+    m2 = re.search(r"\b([a-f0-9]{32})\b", s, re.I)
+    if m2:
+        return m2.group(1).lower()
+    cleaned = re.sub(r"[^a-f0-9]", "", s, flags=re.I).lower()
+    if len(cleaned) == 32:
+        return cleaned
+    return s
 
 def col_exists(df, *names):
     """Повертає тільки ті колонки, які реально існують у DataFrame."""
     return [n for n in names if n in df.columns]
 
 
-def find_tender(tender_id: str) -> pd.DataFrame:
-    """Пошук тендера спочатку exact-match, потім partial-match."""
-    found = tenders[tenders["tender_id"].astype(str).str.strip() == tender_id]
-    if len(found) == 0:
-        found = tenders[tenders["tender_id"].astype(str).str.contains(
-            re.escape(tender_id), na=False
-        )]
-    return found
+def tender_row_value_amount(row: pd.Series) -> float | None:
+    """Очікувана вартість для UI (з value_amount або з log_value_amount)."""
+    if pd.notna(row.get("value_amount")):
+        try:
+            return float(row["value_amount"])
+        except (TypeError, ValueError):
+            pass
+    if pd.notna(row.get("log_value_amount")):
+        try:
+            return float(np.expm1(float(row["log_value_amount"])))
+        except (TypeError, ValueError):
+            pass
+    return None
+
+
+def tender_row_cpv(row: pd.Series) -> object:
+    return row["cpv_code"] if "cpv_code" in row.index and pd.notna(row.get("cpv_code")) else row.get("cpv")
+
+
+def tender_row_num_bids(row: pd.Series) -> int | None:
+    if "num_bids" in row.index and pd.notna(row.get("num_bids")):
+        try:
+            return int(row["num_bids"])
+        except (TypeError, ValueError):
+            pass
+    if "numberOfBids" in row.index and pd.notna(row.get("numberOfBids")):
+        try:
+            return int(row["numberOfBids"])
+        except (TypeError, ValueError):
+            pass
+    return None
 
 
 def build_relation_risk_score(df: pd.DataFrame) -> pd.Series:
@@ -299,19 +341,23 @@ st.markdown(f"""
 </div>
 """, unsafe_allow_html=True)
 
-tab1, tab2, tab3 = st.tabs(["🔍  Тендер-чекер", "🏢  Підрядники", "🔗  Зв'язки"])
+tab1, tab2, tab3 = st.tabs(["Тендери", "Підрядники", "Зв'язки"])
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# TAB 1 — Тендер-чекер
+# TAB 1 — Тендер
 # Колонки: tender_id, risk_score, title, cpv_code, value_amount,
 #          winner_price, num_bids, tender_duration_days, cpv_deviation
-# Вхід: URL з Prozorro → витягуємо UA-XXXX-XX-XX-XXXXXX
+# Вхід: внутрішній id CDB (32 hex) → GET /api/2.5/tenders/{id} + extract + detect_tender_anomalies
 # ════════════════════════════════════════════════════════════════════════════
 
-# Преобчислюємо медіани одноразово для порівнянь
+# Преобчислюємо медіани одноразово для порівнянь (уникаємо 0/NaN → ділення на нуль)
 _med_dur = float(tenders["tender_duration_days"].median()) if "tender_duration_days" in tenders.columns else 14.0
-_med_bids = float(tenders["num_bids"].median())            if "num_bids"             in tenders.columns else 2.0
+_med_bids = float(tenders[BIDS_COL].median()) if BIDS_COL in tenders.columns else 2.0
+if not np.isfinite(_med_dur) or _med_dur <= 0:
+    _med_dur = 14.0
+if not np.isfinite(_med_bids) or _med_bids <= 0:
+    _med_bids = 2.0
 
 with tab1:
     # ── Пошукова панель ──────────────────────────────────────────────────
@@ -321,7 +367,7 @@ with tab1:
     with inp_col:
         raw_input = st.text_input(
             "", label_visibility="collapsed", key="tender_input",
-            placeholder="Вставте посилання на тендер з Prozorro (prozorro.gov.ua/tender/UA-...)"
+            placeholder="Внутрішній id CDB (32 hex), напр. afd94dbae24e42bbb7039da72e3efc2d",
         )
     with btn_col:
         st.markdown('<div class="analyze-btn">', unsafe_allow_html=True)
@@ -330,17 +376,32 @@ with tab1:
 
     st.markdown(
         '<div style="font-size:.65rem;color:var(--muted);margin-top:-.3rem;margin-bottom:1rem;">'
-        'Підтримуються посилання: prozorro.gov.ua/tender/UA-... &nbsp;·&nbsp; '
-        'bi.prozorro.org/... &nbsp;·&nbsp; dozorro.org/tender/UA-...</div>',
-        unsafe_allow_html=True
+        "Вставте <b>внутрішній id</b> закупівлі з відповіді API "
+        "<code>GET public-api.prozorro.gov.ua/api/2.5/tenders/&lt;id&gt;</code> (поле <code>data.id</code>, "
+        "32 шістнадцяткові символи). Посилання на prozorro.gov.ua з UA-… не використовуються — лише цей id.</div>",
+        unsafe_allow_html=True,
     )
 
     if analyze and raw_input.strip():
+        tid = extract_cdb_tender_id(raw_input)
         st.session_state["last_tender_query"] = raw_input.strip()
-        st.session_state["last_tender_id"] = extract_tender_id(raw_input)
+        st.session_state["last_tender_id"] = tid
+        st.session_state.pop("live_result", None)
+        with st.spinner(
+            "Запит до public-api.prozorro.gov.ua, витяг ознак і оцінка моделлю "
+            "(SBERT + Isolation Forest) — зазвичай 1–3 хв…"
+        ):
+            from prozorro_live import score_tender_from_prozorro_api
+
+            ser, err = score_tender_from_prozorro_api(tid, DATA_DIR)
+        if err:
+            st.session_state["live_result"] = {"tid": tid, "error": err}
+        else:
+            st.session_state["live_result"] = {"tid": tid, "row": ser.to_dict()}
     elif not raw_input.strip():
         st.session_state.pop("last_tender_query", None)
         st.session_state.pop("last_tender_id", None)
+        st.session_state.pop("live_result", None)
 
     active_tid = st.session_state.get("last_tender_id")
     pending_recheck = (
@@ -355,15 +416,10 @@ with tab1:
         <div class="card" style="text-align:center;padding:3.5rem 2rem;border-style:dashed;">
             <div style="font-size:2.5rem;margin-bottom:.6rem;">🔍</div>
             <div style="font-family:'Unbounded',sans-serif;font-size:.9rem;">
-                Вставте посилання на тендер
+                Вставте внутрішній id закупівлі (32 hex)
             </div>
             <div style="font-size:.7rem;color:var(--muted);margin-top:.5rem;line-height:1.9;">
-                Система знайде тендер у датасеті та покаже:<br>
-                🔴 Аномальний / ✅ Нормальний &nbsp;·&nbsp;
-                ⚡ Risk score &nbsp;·&nbsp;
-                📋 Деталі &nbsp;·&nbsp;
-                ⚠ Які ознаки спрацювали &nbsp;·&nbsp;
-                📊 Порівняння з CPV-аналогами
+                Натисніть <b>Перевірити</b>, щоб завантажити JSON з API за внутрішнім id, побудувати ознаки та отримати оцінку моделі.
             </div>
         </div>
         """, unsafe_allow_html=True)
@@ -371,35 +427,64 @@ with tab1:
     # ── Аналіз ───────────────────────────────────────────────────────────
     elif active_tid:
         tid = active_tid
-        found = find_tender(tid)
+        live_box = st.session_state.get("live_result") or {}
+        live_ok = live_box.get("tid") == tid and isinstance(live_box.get("row"), dict)
+        live_err = live_box.get("tid") == tid and live_box.get("error")
 
         if pending_recheck:
             st.markdown("""
             <div class="card-sm" style="border-style:dashed;">
-                Натисніть <b>Перевірити</b>, щоб оновити результат для нового посилання.
+                Натисніть <b>Перевірити</b>, щоб оновити результат після зміни id.
             </div>
             """, unsafe_allow_html=True)
 
-        # ── Не знайдено ──
-        if len(found) == 0:
-            st.markdown(f"""
-            <div class="card" style="border-color:var(--warn);text-align:center;padding:2.5rem;">
-                <div style="font-size:1.8rem;margin-bottom:.5rem;">🔎</div>
-                <div style="font-family:'Unbounded',sans-serif;font-size:.95rem;color:var(--warn);">
-                    Тендер не знайдено в датасеті
-                </div>
-                <div style="font-size:.72rem;color:var(--muted);margin-top:.6rem;line-height:1.8;">
-                    Витягнутий ID: <code style="color:var(--text);background:rgba(255,255,255,.06);
-                    padding:.1rem .4rem;border-radius:3px;">{tid}</code><br>
-                    Можливі причини: тендер не потрапив у вибірку датасету,
-                    або ID у посиланні має інший формат
-                </div>
-            </div>
-            """, unsafe_allow_html=True)
-
-        # ── Знайдено ──
+        if live_ok:
+            row = pd.Series(live_box["row"])
         else:
-            row      = found.iloc[0]
+            row = None
+
+        if live_err:
+            st.error(str(live_err))
+
+        # ── Немає успішної оцінки (ще не натискали «Перевірити» або помилка API/моделі) ──
+        if row is None:
+            if not live_err:
+                st.markdown(f"""
+                <div class="card" style="border-style:dashed;text-align:center;padding:2.2rem;">
+                    <div style="font-size:1.6rem;margin-bottom:.4rem;">⏳</div>
+                    <div style="font-family:'Unbounded',sans-serif;font-size:.88rem;">
+                        Готово до перевірки
+                    </div>
+                    <div style="font-size:.72rem;color:var(--muted);margin-top:.5rem;line-height:1.8;">
+                        Введено: <code style="color:var(--text);background:rgba(255,255,255,.06);
+                        padding:.1rem .4rem;border-radius:3px;">{tid}</code><br>
+                        Потрібен внутрішній id CDB (32 hex) з відповіді API. Натисніть <b>Перевірити</b>.
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+            else:
+                st.markdown(f"""
+                <div class="card" style="border-color:var(--warn);text-align:center;padding:2rem;">
+                    <div style="font-size:1.5rem;margin-bottom:.35rem;">⚠</div>
+                    <div style="font-family:'Unbounded',sans-serif;font-size:.88rem;color:var(--warn);">
+                        Не вдалося отримати оцінку
+                    </div>
+                    <div style="font-size:.72rem;color:var(--muted);margin-top:.45rem;line-height:1.8;">
+                        ID: <code style="color:var(--text);background:rgba(255,255,255,.06);
+                        padding:.1rem .4rem;border-radius:3px;">{tid}</code><br>
+                        Перевірте внутрішній id (32 hex), з'єднання з інтернетом; деталі помилки — вище.
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+
+        # ── Результат (JSON API + модель) ──
+        else:
+            st.info(
+                "Запит **GET /api/2.5/tenders/{id}** (внутрішній id CDB) → `extract_tender_features` → "
+                "`detect_tender_anomalies` на підвибірці історичних тендерів тієї ж CPV-групи. "
+                "Перцентиль і поріг 80% порівнюються з повним збереженим датасетом у UI — **наближення**."
+            )
+
             score    = float(row["risk_score"])
             pct_fill = score / T_MAX * 100
             sc       = score_css(score, T_MAX)
@@ -442,8 +527,8 @@ with tab1:
                         f"💰 Ціна в межах норми (відхилення {dev:.2f}×)",
                         "Вартість тендера відповідає типовому діапазону для цієї CPV-категорії."))
 
-            # 2. Конкурентність (num_bids)
-            nb = int(row["num_bids"]) if pd.notna(row.get("num_bids")) else None
+            # 2. Конкурентність (кількість пропозицій)
+            nb = tender_row_num_bids(row)
             if nb is not None:
                 if nb == 1:
                     flags.append(("f-red",
@@ -464,10 +549,11 @@ with tab1:
             # 3. Тривалість тендеру
             dur = float(row["tender_duration_days"]) if pd.notna(row.get("tender_duration_days")) else None
             if dur is not None:
+                dur_safe = max(dur, 1e-9)
                 if dur < _med_dur * 0.3:
                     flags.append(("f-red",
                         f"⏱ Підозріло короткий термін: {dur:.0f} днів",
-                        f"Тривалість тендеру ({dur:.0f} дн.) у {_med_dur/dur:.1f}× коротша "
+                        f"Тривалість тендеру ({dur:.0f} дн.) у {_med_dur/dur_safe:.1f}× коротша "
                         f"за медіану ({_med_dur:.0f} дн.). Це може навмисно обмежувати "
                         f"коло потенційних учасників."))
                 elif dur > _med_dur * 4:
@@ -481,7 +567,7 @@ with tab1:
                         f"Термін проведення відповідає типовому діапазону."))
 
             # 4. Різниця очікуваної вартості та ціни переможця
-            va  = float(row["value_amount"]) if pd.notna(row.get("value_amount")) else None
+            va  = tender_row_value_amount(row)
             wp  = float(row["winner_price"]) if pd.notna(row.get("winner_price")) else None
             if va and wp and va > 0:
                 discount = (va - wp) / va
@@ -552,10 +638,11 @@ with tab1:
             # ── Право: деталі тендера ──
             with right_col:
                 title_str = str(row["title"])[:120] if pd.notna(row.get("title")) else "—"
-                cpv_str   = str(row["cpv_code"])    if pd.notna(row.get("cpv_code"))   else "—"
-                va_str    = fmt_money(row["value_amount"])  if pd.notna(row.get("value_amount"))  else "—"
+                cpv_str   = str(tender_row_cpv(row)) if pd.notna(tender_row_cpv(row)) else "—"
+                va_raw    = tender_row_value_amount(row)
+                va_str    = fmt_money(va_raw) if va_raw is not None else "—"
                 wp_str    = fmt_money(row["winner_price"])  if pd.notna(row.get("winner_price"))  else "—"
-                nb_str    = str(int(row["num_bids"]))       if pd.notna(row.get("num_bids"))       else "—"
+                nb_str    = str(nb) if nb is not None else "—"
                 dur_str   = f"{float(row['tender_duration_days']):.0f} дн." if pd.notna(row.get("tender_duration_days")) else "—"
                 dev_str   = f"{float(row['cpv_deviation']):.3f}×"           if pd.notna(row.get("cpv_deviation"))       else "—"
 
@@ -602,11 +689,11 @@ with tab1:
                 """, unsafe_allow_html=True)
 
             # ── Порівняння з аналогами по CPV ─────────────────────────────
-            cpv = row.get("cpv_code")
+            cpv = tender_row_cpv(row)
             if pd.notna(cpv):
                 same_cpv = (
                     tenders[
-                        (tenders["cpv_code"] == cpv) &
+                        (tenders[TENDER_CPV_COL] == cpv) &
                         (tenders["tender_id"].astype(str) != str(row["tender_id"]))
                     ]
                     .sort_values("risk_score", ascending=False)
@@ -615,8 +702,8 @@ with tab1:
 
                 if len(same_cpv) > 0:
                     # Статистика по CPV
-                    cpv_med_score = tenders[tenders["cpv_code"] == cpv]["risk_score"].median()
-                    cpv_count     = len(tenders[tenders["cpv_code"] == cpv])
+                    cpv_med_score = tenders[tenders[TENDER_CPV_COL] == cpv]["risk_score"].median()
+                    cpv_count     = len(tenders[tenders[TENDER_CPV_COL] == cpv])
 
                     st.markdown(f"""
                     <div class="sec">Порівняння з аналогами у CPV {cpv}
@@ -628,10 +715,15 @@ with tab1:
                     </div>
                     """, unsafe_allow_html=True)
 
-                    show_cols = ["tender_id", "risk_score", "value_amount",
-                                 "winner_price", "num_bids", "cpv_deviation",
-                                 "tender_duration_days"]
-                    show_cols = [c for c in show_cols if c in same_cpv.columns]
+                    want_cols = [
+                        "tender_id", "risk_score", "value_amount", "log_value_amount",
+                        "winner_price", BIDS_COL, "cpv_deviation", "tender_duration_days",
+                    ]
+                    show_cols = []
+                    for c in want_cols:
+                        if c in same_cpv.columns and c not in show_cols:
+                            show_cols.append(c)
+                    show_cols = show_cols[:8]
                     st.dataframe(
                         same_cpv[show_cols].reset_index(drop=True),
                         use_container_width=True, hide_index=True, height=280
@@ -652,7 +744,7 @@ with tab2:
 
         st.markdown('<div class="sec">Мінімальна кількість перемог</div>', unsafe_allow_html=True)
         max_wins = int(suppliers["num_wins"].max()) if "num_wins" in suppliers.columns else 200
-        min_wins = st.slider("", 1, max(max_wins, 2), min(5, max_wins),
+        min_wins = st.slider("", 0, max(max_wins, 2), min(5, max_wins),
                              label_visibility="collapsed", key="s_minwins")
 
         fs = suppliers.copy()
@@ -825,91 +917,90 @@ with tab3:
     else:
         R_MAX = float(rel["risk_score"].max()) or 1.0
 
-        ctrl, graph = st.columns([1, 3], gap="large")
+        st.markdown('<div class="sec">Фільтри</div>', unsafe_allow_html=True)
 
-        with ctrl:
-            st.markdown('<div class="sec">Фільтри графа</div>', unsafe_allow_html=True)
+        r_min_v = float(rel["risk_score"].min())
+        r_max_v = float(rel["risk_score"].max())
+        step = round((r_max_v - r_min_v) / 100, 4) or 0.001
 
-            r_min_v = float(rel["risk_score"].min())
-            r_max_v = float(rel["risk_score"].max())
-            step = round((r_max_v - r_min_v) / 100, 4) or 0.001
+        min_risk = st.slider(
+            "Мін. ризик-скор", r_min_v, r_max_v,
+            round(r_min_v + (r_max_v - r_min_v) * 0.25, 4),
+            step=step, key="rel_risk", format="%.3f"
+        )
 
-            min_risk = st.slider(
-                "Мін. ризик-скор", r_min_v, r_max_v,
-                round(r_min_v + (r_max_v - r_min_v) * 0.25, 4),
-                step=step, key="rel_risk", format="%.3f"
+        t_max_v = int(rel["num_tenders"].max()) if "num_tenders" in rel.columns else 50
+        min_tend = st.slider("Мін. к-сть тендерів", 1, max(t_max_v, 2),
+                             min(3, t_max_v), key="rel_tend")
+
+        frel = rel.copy()
+        frel = frel[frel["risk_score"] >= min_risk]
+        if "num_tenders" in rel.columns:
+            frel = frel[frel["num_tenders"] >= min_tend]
+
+        n_pairs = len(frel)
+        n_buy = frel["buyer_id"].nunique() if "buyer_id" in frel.columns else 0
+        n_sup = frel["supplier_id"].nunique() if "supplier_id" in frel.columns else 0
+
+        st.markdown(f"""
+        <div class="card-sm" style="margin-top:.5rem;margin-bottom:.6rem;">
+            <div class="stats" style="gap:.5rem;">
+                <div class="stat"><div class="stat-val">{n_pairs}</div><div class="stat-key">Пар</div></div>
+                <div class="stat"><div class="stat-val">{n_buy}</div><div class="stat-key">Замовн.</div></div>
+                <div class="stat"><div class="stat-val">{n_sup}</div><div class="stat-key">Підряд.</div></div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        st.markdown("""
+        <div class="sec">Легенда графа</div>
+        <div style="font-size:.7rem;line-height:2.2;margin-bottom:.6rem;">
+            🔵 Замовник &nbsp; 🔴 Підрядник<br>
+            <span style="color:#e84545;font-weight:700;">━━</span> Високий ризик
+            &nbsp;·&nbsp;
+            <span style="color:#f59e0b;font-weight:700;">━━</span> Середній ризик
+            &nbsp;·&nbsp;
+            <span style="color:#3b82f6;font-weight:700;">━━</span> Низький ризик<br>
+            <span style="color:var(--muted);">Товщина ребра ∝ к-сть тендерів. Ризик = sbs×0.4 + bws×0.3 + sis×0.3. Наведіть курсор на вузол чи ребро.</span>
+        </div>
+        """, unsafe_allow_html=True)
+
+        st.markdown("""
+        <div style="font-family:'Unbounded',sans-serif;font-size:.9rem;
+                    font-weight:700;margin:.4rem 0 .35rem;">
+            Граф ризикових зв'язків
+        </div>
+        """, unsafe_allow_html=True)
+
+        if len(frel) == 0:
+            st.markdown("""
+            <div class="card" style="text-align:center;padding:4rem;border-style:dashed;">
+                <div style="font-size:2rem;">📭</div>
+                <div style="font-family:'Unbounded',sans-serif;font-size:.85rem;margin-top:.5rem;">
+                    Немає зв'язків за фільтрами
+                </div>
+                <div style="font-size:.7rem;color:var(--muted);margin-top:.3rem;">
+                    Спробуйте знизити порогові значення
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+        else:
+            CAP = 200
+            draw = frel.sort_values("risk_score", ascending=False).head(CAP)
+            if len(frel) > CAP:
+                st.markdown(
+                    f'<span class="flag f-yellow">Показано топ-{CAP} з {len(frel)} зв\'язків</span>',
+                    unsafe_allow_html=True,
+                )
+
+            net = Network(
+                height="640px",
+                width="100%",
+                bgcolor="#111318",
+                font_color="#e2e8f0",
             )
-
-            t_max_v = int(rel["num_tenders"].max()) if "num_tenders" in rel.columns else 50
-            min_tend = st.slider("Мін. к-сть тендерів", 1, max(t_max_v, 2),
-                                 min(3, t_max_v), key="rel_tend")
-
-            frel = rel.copy()
-            frel = frel[frel["risk_score"] >= min_risk]
-            if "num_tenders" in rel.columns:
-                frel = frel[frel["num_tenders"] >= min_tend]
-
-            n_pairs = len(frel)
-            n_buy = frel["buyer_id"].nunique() if "buyer_id" in frel.columns else 0
-            n_sup = frel["supplier_id"].nunique() if "supplier_id" in frel.columns else 0
-
-            st.markdown(f"""
-            <div class="card-sm" style="margin-top:.8rem;">
-                <div class="stats" style="gap:.5rem;">
-                    <div class="stat"><div class="stat-val">{n_pairs}</div><div class="stat-key">Пар</div></div>
-                    <div class="stat"><div class="stat-val">{n_buy}</div><div class="stat-key">Замовн.</div></div>
-                    <div class="stat"><div class="stat-val">{n_sup}</div><div class="stat-key">Підряд.</div></div>
-                </div>
-            </div>
-            """, unsafe_allow_html=True)
-
-            st.markdown("""
-            <div class="sec">Легенда</div>
-            <div style="font-size:.7rem;line-height:2.2;">
-                🔵 Замовник &nbsp; 🔴 Підрядник<br>
-                <span style="color:#e84545;font-weight:700;">━━</span> Високий ризик<br>
-                <span style="color:#f59e0b;font-weight:700;">━━</span> Середній ризик<br>
-                <span style="color:#3b82f6;font-weight:700;">━━</span> Низький ризик
-            </div>
-            <div style="font-size:.62rem;color:var(--muted);margin-top:.7rem;line-height:1.7;">
-                Товщина ребра = к-сть тендерів<br>
-                Ризик = sbs×0.4 + bws×0.3 + sis×0.3<br>
-                Наведіть курсор для деталей
-            </div>
-            """, unsafe_allow_html=True)
-
-        with graph:
-            st.markdown("""
-            <div style="font-family:'Unbounded',sans-serif;font-size:.9rem;
-                        font-weight:700;margin-bottom:.3rem;">
-                Граф ризикових зв'язків
-            </div>
-            """, unsafe_allow_html=True)
-
-            if len(frel) == 0:
-                st.markdown("""
-                <div class="card" style="text-align:center;padding:4rem;border-style:dashed;">
-                    <div style="font-size:2rem;">📭</div>
-                    <div style="font-family:'Unbounded',sans-serif;font-size:.85rem;margin-top:.5rem;">
-                        Немає зв'язків за фільтрами
-                    </div>
-                    <div style="font-size:.7rem;color:var(--muted);margin-top:.3rem;">
-                        Спробуйте знизити порогові значення
-                    </div>
-                </div>
-                """, unsafe_allow_html=True)
-            else:
-                CAP = 200
-                draw = frel.sort_values("risk_score", ascending=False).head(CAP)
-                if len(frel) > CAP:
-                    st.markdown(
-                        f'<span class="flag f-yellow">Показано топ-{CAP} з {len(frel)} зв\'язків</span>',
-                        unsafe_allow_html=True
-                    )
-
-            net = Network(height="640px", width="100%",
-                          bgcolor="#111318", font_color="#e2e8f0")
-            net.set_options("""
+            net.set_options(
+                """
             {
               "physics": {
                 "barnesHut": {
@@ -922,59 +1013,78 @@ with tab3:
               "edges": { "smooth": { "type": "dynamic" } },
               "interaction": { "hover": true, "tooltipDelay": 60 }
             }
-            """)
+            """
+            )
 
-            seen = set()
+            seen: set[str] = set()
             for _, row in draw.iterrows():
-                b_id  = str(row["buyer_id"])
-                s_id  = str(row["supplier_id"])
-                bkey  = f"B_{b_id}"
-                skey  = f"S_{s_id}"
+                b_id = str(row["buyer_id"])
+                s_id = str(row["supplier_id"])
+                bkey = f"B_{b_id}"
+                skey = f"S_{s_id}"
 
                 score = float(row["risk_score"])
                 ntend = int(row["num_tenders"]) if "num_tenders" in row.index else 1
-                sbs   = fmt_pct(row.get("single_bid_share",     "n/a"))
-                bws   = fmt_pct(row.get("buyer_win_share",       "n/a"))
-                sis   = fmt_pct(row.get("supplier_income_share", "n/a"))
+                sbs = fmt_pct(row.get("single_bid_share", "n/a"))
+                bws = fmt_pct(row.get("buyer_win_share", "n/a"))
+                sis = fmt_pct(row.get("supplier_income_share", "n/a"))
 
                 r = score / R_MAX
-                if r >= .65:
+                if r >= 0.65:
                     ec, ew = "#e84545", 5
-                elif r >= .35:
+                elif r >= 0.35:
                     ec, ew = "#f59e0b", 3
                 else:
                     ec, ew = "#3b82f6", 1.5
 
                 if bkey not in seen:
-                    buyer_total = int(
-                        frel[frel["buyer_id"].astype(str) == b_id]["num_tenders"].sum()
-                    ) if "num_tenders" in frel.columns else 10
-                    net.add_node(bkey,
+                    buyer_total = (
+                        int(frel[frel["buyer_id"].astype(str) == b_id]["num_tenders"].sum())
+                        if "num_tenders" in frel.columns
+                        else 10
+                    )
+                    net.add_node(
+                        bkey,
                         label=b_id[:14],
-                        color={"background":"#0f2744","border":"#3b82f6",
-                               "highlight":{"background":"#1d4ed8","border":"#93c5fd"}},
+                        color={
+                            "background": "#0f2744",
+                            "border": "#3b82f6",
+                            "highlight": {"background": "#1d4ed8", "border": "#93c5fd"},
+                        },
                         size=max(14, min(30, buyer_total // 3)),
                         shape="dot",
                         title=f"<b>🏛 Замовник</b><br>{b_id}<br>Всього тендерів: {buyer_total}",
-                        font={"color":"#93c5fd","size":11})
+                        font={"color": "#93c5fd", "size": 11},
+                    )
                     seen.add(bkey)
 
                 if skey not in seen:
-                    sup_r = suppliers.loc[
-                        suppliers["supplier_id"].astype(str) == s_id, "risk_score"
-                    ].values if "supplier_id" in suppliers.columns else []
+                    sup_r = (
+                        suppliers.loc[
+                            suppliers["supplier_id"].astype(str) == s_id, "risk_score"
+                        ].values
+                        if "supplier_id" in suppliers.columns
+                        else []
+                    )
                     sup_score_str = f"{sup_r[0]:.3f}" if len(sup_r) else "n/a"
-                    net.add_node(skey,
+                    net.add_node(
+                        skey,
                         label=s_id[:14],
-                        color={"background":"#3b0f0f","border":"#e84545",
-                               "highlight":{"background":"#991b1b","border":"#fca5a5"}},
+                        color={
+                            "background": "#3b0f0f",
+                            "border": "#e84545",
+                            "highlight": {"background": "#991b1b", "border": "#fca5a5"},
+                        },
                         size=max(10, min(22, ntend // 2)),
                         shape="dot",
                         title=f"<b>🏢 Підрядник</b><br>{s_id}<br>Risk score: {sup_score_str}",
-                        font={"color":"#fca5a5","size":11})
+                        font={"color": "#fca5a5", "size": 11},
+                    )
                     seen.add(skey)
 
-                net.add_edge(bkey, skey,
+                net.add_edge(
+                    bkey,
+                    skey,
                     value=max(ew, ntend / 8),
                     color={"color": ec, "highlight": "#ffffff", "opacity": 0.85},
                     arrows={"to": {"enabled": True, "scaleFactor": 0.55}},
@@ -985,22 +1095,23 @@ with tab3:
                         f"Single-bid частка: {sbs}<br>"
                         f"Замовник виграє: {bws}<br>"
                         f"Частка доходу підрядника: {sis}"
-                    )
+                    ),
                 )
 
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".html",
-                                                 mode="w", encoding="utf-8") as tmp:
-                    net.save_graph(tmp.name)
-                    html_str = Path(tmp.name).read_text(encoding="utf-8")
+            with tempfile.NamedTemporaryFile(
+                delete=False, suffix=".html", mode="w", encoding="utf-8"
+            ) as tmp:
+                net.save_graph(tmp.name)
+                html_str = Path(tmp.name).read_text(encoding="utf-8")
 
-                st.components.v1.html(html_str, height=650, scrolling=False)
+            st.components.v1.html(html_str, height=650, scrolling=False)
 
-            if len(frel) > 0:
-                st.markdown('<div class="sec" style="margin-top:1rem;">Таблиця зв\'язків</div>',
-                            unsafe_allow_html=True)
-                show = col_exists(frel, "buyer_id", "supplier_id", "num_tenders", "risk_score",
-                                  "single_bid_share", "buyer_win_share", "supplier_income_share")
-                st.dataframe(
-                    frel[show].sort_values("risk_score", ascending=False).reset_index(drop=True),
-                    use_container_width=True, hide_index=True, height=250
-                )
+        if len(frel) > 0:
+            st.markdown('<div class="sec" style="margin-top:1rem;">Таблиця зв\'язків</div>',
+                        unsafe_allow_html=True)
+            show = col_exists(frel, "buyer_id", "supplier_id", "num_tenders", "risk_score",
+                              "single_bid_share", "buyer_win_share", "supplier_income_share")
+            st.dataframe(
+                frel[show].sort_values("risk_score", ascending=False).reset_index(drop=True),
+                use_container_width=True, hide_index=True, height=250
+            )
