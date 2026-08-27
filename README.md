@@ -304,8 +304,3 @@ These can be reviewed without re-running the full pipeline.
 - **Data scope:** Features are derived from open Prozorro JSON; document coverage depends on availability and `DOCUMENT_FETCH` settings.
 - **No production deployment:** This is a research / thesis prototype, not an audited compliance tool.
 
----
-
-## License
-
-Academic / research project. Add a license file if you plan to open-source or redistribute.
