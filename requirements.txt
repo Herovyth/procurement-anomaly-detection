@@ -17,3 +17,5 @@ hdbscan>=0.8
 sentence-transformers>=2.2
 
 matplotlib>=3.7
+seaborn>=0.13
+shap>=0.44
